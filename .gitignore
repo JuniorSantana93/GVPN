@@ -1,0 +1,30 @@
+# Local credentials, caches, and development-only state
+.appdata/
+.localappdata/
+.dotnet-cli/
+.nuget/
+.gopath/
+.gocache/
+*.user
+*.suo
+*.cache
+*.log
+
+# Build and publish output
+bin/
+obj/
+build-webview/
+GVPN_*/
+ThirdParty/proton-confgen/build/*.exe
+/GVPN_Source_*.zip
+
+# WebView2 profiles and local data
+**/GVPN.exe.WebView2/
+**/EBWebView/
+
+# IDE / OS noise
+.vs/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

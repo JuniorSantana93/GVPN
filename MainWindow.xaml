@@ -1,0 +1,11 @@
+<Window x:Class="GVPN.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="GVPN" Height="900" Width="1320" MinHeight="700" MinWidth="1000"
+        WindowStartupLocation="CenterScreen" ResizeMode="CanResize"
+        Background="#0B1119" Loaded="Window_Loaded">
+    <Grid>
+        <wv2:WebView2 x:Name="AppWebView" />
+    </Grid>
+</Window>
