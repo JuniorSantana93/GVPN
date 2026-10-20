@@ -46,10 +46,6 @@ Baixe `GVPN.exe` na página [Releases](../../releases/latest) e confira o hash S
 
 O resultado `publish/GVPN.exe` contém a interface, o helper Proton e as dependências .NET. O runtime Evergreen do WebView2 continua sendo um requisito externo.
 
-## Site do projeto
-
-O site institucional fica em [`site/`](site/). O workflow [`.github/workflows/pages.yml`](.github/workflows/pages.yml) publica essa pasta no GitHub Pages quando há alterações na branch `main`.
-
 ## Publicar uma versão
 
 Depois de enviar uma tag de versão, por exemplo `v1.0.0`, o workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) compila o helper Proton e o GVPN.exe self-contained para Windows x64, calcula seu SHA-256 e anexa ambos a uma GitHub Release.
