@@ -292,7 +292,40 @@ public partial class MainWindow : Window
         {
             var generated = await _proton.GenerateProfileAsync(_username, server);
             if (!generated.Success) { _connectionStatus = "FALHA AO GERAR PERFIL"; _serverSummary = generated.Message; _connectedServer = null; return; }
-            _connectionStatus = "INICIANDO ADAPTADOR WIREGUARD…"; await PushWebStateAsync();
+
+            if (!_tunnel.HasWireSock)
+            {
+                var installChoice = MessageBox.Show(this,
+                    "O WireSock SDK é necessário para o Split Tunneling e permite que o GVPN use o WireSock para a conexão completa.\n\n" +
+                    "O GVPN vai abrir o WinGet oficial para baixar e instalar NTKERNEL.WireSockVPNClientCLI. Você poderá revisar e aceitar os termos do WinGet e do fornecedor na janela que será aberta.\n\n" +
+                    "O WireSock é gratuito para uso pessoal, educacional e sem fins lucrativos; uso comercial exige licença Pro.\n\n" +
+                    "Deseja instalar agora?",
+                    "Instalar dependência WireSock", MessageBoxButton.YesNo, MessageBoxImage.Question);
+
+                if (installChoice == MessageBoxResult.Yes)
+                {
+                    _connectionStatus = "INSTALANDO WIRESOCK…";
+                    _serverSummary = "O WinGet está instalando o WireSock SDK. A janela do instalador pode solicitar sua confirmação.";
+                    await PushWebStateAsync();
+                    var installation = await _tunnel.InstallWireSockSdkAsync();
+                    if (!installation.Success && _tunneledApps.Count > 0)
+                    {
+                        _connectionStatus = "FALHA NA CONEXÃO";
+                        _serverSummary = installation.Message;
+                        _connectedServer = null;
+                        return;
+                    }
+                }
+                else if (_tunneledApps.Count > 0)
+                {
+                    _connectionStatus = "FALHA NA CONEXÃO";
+                    _serverSummary = "Split Tunneling precisa do WireSock SDK. Instale-o para usar a VPN com programas selecionados.";
+                    _connectedServer = null;
+                    return;
+                }
+            }
+
+            _connectionStatus = "INICIANDO TÚNEL VPN…"; await PushWebStateAsync();
             var connected = await _tunnel.ConnectAsync(_proton.ProfileFile, _tunneledApps);
             if (!connected.Success) { _connectionStatus = "FALHA NA CONEXÃO"; _serverSummary = connected.StatusMessage; _connectedServer = null; return; }
             _connectionStatus = "VPN CONECTADA"; _connectedAt = DateTime.Now; _connectionTimer.Start();

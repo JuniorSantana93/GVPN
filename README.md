@@ -18,8 +18,12 @@ Cliente de VPN para Windows com interface WebView2 e integração com uma conta 
 - Microsoft Edge WebView2 Runtime Evergreen instalado.
 - Uma conta Proton VPN válida.
 - Privilégios administrativos do Windows para criar e gerenciar o túnel VPN.
+- O GVPN oferece instalar o WireSock SDK oficial pelo WinGet quando ele não está presente. É necessária conexão à internet, WinGet disponível e confirmação dos termos/licença do fornecedor. A licença gratuita do SDK é limitada a uso não comercial.
+- Se a instalação do WireSock for recusada ou não estiver disponível, Split Tunneling exige instalação manual do WireSock SDK. Para conexão completa sem WireSock, o cliente oficial do WireGuard é necessário.
 
 O executável publicado é self-contained para o .NET, mas o Runtime Evergreen do WebView2 é instalado e atualizado separadamente pelo Windows/Edge.
+
+Na primeira conexão sem WireSock, o GVPN pergunta se pode instalar `NTKERNEL.WireSockVPNClientCLI` pelo WinGet. O instalador oficial é executado fora do GVPN e os termos do pacote devem ser aceitos pelo usuário. O SDK e seus drivers não são empacotados nem redistribuídos pelo projeto.
 
 ## Obter o aplicativo
 

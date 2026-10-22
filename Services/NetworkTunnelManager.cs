@@ -11,6 +11,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 
 namespace GVPN.Services
 {
@@ -22,7 +23,60 @@ namespace GVPN.Services
         private Process? _wireSockProcess;
         private int _intentionalWireSockExit;
         public bool IsConnected { get; private set; }
+        public bool HasWireSock => FindWireSockExecutable() is not null;
         public event EventHandler<string>? ConnectionLost;
+
+        public async Task<(bool Success, string Message)> InstallWireSockSdkAsync()
+        {
+            _wireSockExe = FindWireSockExecutable();
+            if (_wireSockExe is not null) return (true, "WireSock SDK já está instalado.");
+
+            var start = new ProcessStartInfo
+            {
+                FileName = "winget.exe",
+                UseShellExecute = false,
+                CreateNoWindow = false
+            };
+            foreach (string argument in new[]
+            {
+                "install", "--id", "NTKERNEL.WireSockVPNClientCLI", "--exact"
+            })
+                start.ArgumentList.Add(argument);
+
+            try
+            {
+                using var process = new Process { StartInfo = start };
+                process.Start();
+                using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(20));
+                try { await process.WaitForExitAsync(timeout.Token); }
+                catch (OperationCanceledException)
+                {
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                    return (false, "A instalação do WireSock pelo WinGet excedeu 20 minutos.");
+                }
+
+                if (process.ExitCode != 0)
+                    return (false, $"O WinGet encerrou com código {process.ExitCode}. Confira a janela do instalador e os termos do WireSock.");
+
+                for (int attempt = 0; attempt < 20; attempt++)
+                {
+                    _wireSockExe = FindWireSockExecutable();
+                    if (_wireSockExe is not null)
+                        return (true, "WireSock SDK instalado e encontrado.");
+                    await Task.Delay(1000);
+                }
+
+                return (false, "O WinGet concluiu, mas o executável wiresock-client.exe não foi encontrado. Confira a instalação do WireSock SDK.");
+            }
+            catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 2)
+            {
+                return (false, "O WinGet não está disponível neste Windows. Instale o WireSock SDK pelo site oficial e tente novamente.");
+            }
+            catch (Exception ex)
+            {
+                return (false, $"Não foi possível instalar o WireSock SDK pelo WinGet: {ex.Message}");
+            }
+        }
 
         public async Task<(bool Success, string StatusMessage)> ConnectAsync(string configPath, IReadOnlyList<string>? tunneledApps = null)
         {
@@ -340,14 +394,72 @@ namespace GVPN.Services
         {
             string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
             string programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
-            var candidates = new[]
+            var roots = new[]
             {
-                Path.Combine(programFiles, "WireSock Secure Connect", "sdk", "wiresock-client.exe"),
-                Path.Combine(programFiles, "WireSock Secure Connect", "wiresock-client.exe"),
-                Path.Combine(programFilesX86, "WireSock Secure Connect", "sdk", "wiresock-client.exe"),
-                Path.Combine(programFilesX86, "WireSock Secure Connect", "wiresock-client.exe")
+                Path.Combine(programFiles, "WireSock Secure Connect"),
+                Path.Combine(programFiles, "WireSock Secure Connect SDK"),
+                Path.Combine(programFiles, "WireSock VPN Client"),
+                Path.Combine(programFiles, "WireSock"),
+                Path.Combine(programFilesX86, "WireSock Secure Connect"),
+                Path.Combine(programFilesX86, "WireSock Secure Connect SDK"),
+                Path.Combine(programFilesX86, "WireSock VPN Client"),
+                Path.Combine(programFilesX86, "WireSock")
             };
-            return candidates.FirstOrDefault(File.Exists);
+            var searchRoots = roots.Concat(GetWireSockInstallLocations()).Distinct(StringComparer.OrdinalIgnoreCase);
+            foreach (string root in searchRoots)
+            {
+                foreach (string candidate in new[]
+                {
+                    Path.Combine(root, "sdk", "wiresock-client.exe"),
+                    Path.Combine(root, "wiresock-client.exe"),
+                    Path.Combine(root, "bin", "wiresock-client.exe")
+                })
+                    if (File.Exists(candidate)) return candidate;
+
+                try
+                {
+                    if (Directory.Exists(root))
+                    {
+                        string? nested = Directory.EnumerateFiles(root, "wiresock-client.exe", SearchOption.AllDirectories).FirstOrDefault();
+                        if (nested is not null) return nested;
+                    }
+                }
+                catch (UnauthorizedAccessException) { }
+                catch (IOException) { }
+            }
+            return null;
+        }
+
+        private static IReadOnlyList<string> GetWireSockInstallLocations()
+        {
+            var locations = new List<string>();
+            foreach (RegistryView view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
+            {
+                RegistryKey? baseKey = null;
+                try
+                {
+                    baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+                    using var appPaths = baseKey.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\wiresock-client.exe");
+                    if (appPaths?.GetValue(null) is string executable && Path.IsPathFullyQualified(executable))
+                        locations.Add(Path.GetDirectoryName(executable)!);
+
+                    using var uninstall = baseKey.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall");
+                    if (uninstall is null) continue;
+                    foreach (string subkeyName in uninstall.GetSubKeyNames())
+                    {
+                        using var entry = uninstall.OpenSubKey(subkeyName);
+                        string? displayName = entry?.GetValue("DisplayName") as string;
+                        string? installLocation = entry?.GetValue("InstallLocation") as string;
+                        if (!string.IsNullOrWhiteSpace(displayName) && displayName.Contains("WireSock", StringComparison.OrdinalIgnoreCase) &&
+                            !string.IsNullOrWhiteSpace(installLocation) && Path.IsPathFullyQualified(installLocation))
+                            locations.Add(installLocation);
+                    }
+                }
+                catch (UnauthorizedAccessException) { }
+                catch (IOException) { }
+                finally { baseKey?.Dispose(); }
+            }
+            return locations;
         }
 
         private static bool IsTunnelAdapterUp(string tunnelName)
