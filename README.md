@@ -27,7 +27,7 @@ Na primeira conexão sem WireSock, o GVPN pergunta se pode instalar `NTKERNEL.Wi
 
 ## Obter o aplicativo
 
-Baixe `GVPN.exe` na página [Releases](../../releases/latest) e confira o hash SHA-256 publicado junto do arquivo. O app é distribuído como um único executável; no primeiro uso, o componente Proton auxiliar é extraído para `%LOCALAPPDATA%\GVPN\bin`.
+Baixe `GVPN.exe` na página [Releases](../../releases/latest). O app é distribuído como um único executável; no primeiro uso, o componente Proton auxiliar é extraído para `%LOCALAPPDATA%\GVPN\bin`.
 
 ## Compilar
 
@@ -52,7 +52,7 @@ O resultado `publish/GVPN.exe` contém a interface, o helper Proton e as depend�
 
 ## Publicar uma versão
 
-Depois de enviar uma tag de versão, por exemplo `v1.0.0`, o workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) compila o helper Proton e o GVPN.exe self-contained para Windows x64, calcula seu SHA-256 e anexa ambos a uma GitHub Release.
+Depois de enviar uma tag de versão, por exemplo `v1.0.0`, o workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) compila o helper Proton e o GVPN.exe self-contained para Windows x64 e anexa o executável a uma GitHub Release.
 
 ## Aviso de segurança e privacidade
 
