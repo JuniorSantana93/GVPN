@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Runtime.InteropServices;
 using System.Net.Http;
 using System.Reflection;
+using System.Windows.Interop;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
@@ -56,6 +57,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        SourceInitialized += (_, _) => ApplyDarkTitleBar();
         Closing += MainWindow_Closing;
         StateChanged += MainWindow_StateChanged;
         LoadAppSettings();
@@ -82,6 +84,35 @@ public partial class MainWindow : Window
             return $"{(int)elapsed.TotalHours:00}:{elapsed.Minutes:00}:{elapsed.Seconds:00}";
         }
     }
+
+    private void ApplyDarkTitleBar()
+    {
+        IntPtr handle = new WindowInteropHelper(this).Handle;
+        if (handle == IntPtr.Zero) return;
+
+        uint enabled = 1;
+        SetDwmAttribute(handle, 20, ref enabled); // DWMWA_USE_IMMERSIVE_DARK_MODE
+
+        // Windows 11 supports explicit non-client colors; older versions keep the dark-mode fallback above.
+        uint captionColor = ToColorRef(0x0B, 0x11, 0x19);
+        uint borderColor = ToColorRef(0x0B, 0x11, 0x19);
+        uint textColor = ToColorRef(0xF2, 0xF6, 0xFB);
+        SetDwmAttribute(handle, 35, ref captionColor); // DWMWA_CAPTION_COLOR
+        SetDwmAttribute(handle, 34, ref borderColor);  // DWMWA_BORDER_COLOR
+        SetDwmAttribute(handle, 36, ref textColor);    // DWMWA_TEXT_COLOR
+    }
+
+    private static uint ToColorRef(byte red, byte green, byte blue) => (uint)(red | (green << 8) | (blue << 16));
+
+    private static void SetDwmAttribute(IntPtr handle, int attribute, ref uint value)
+    {
+        try { _ = DwmSetWindowAttribute(handle, attribute, ref value, sizeof(uint)); }
+        catch (DllNotFoundException) { }
+        catch (EntryPointNotFoundException) { }
+    }
+
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref uint value, uint valueSize);
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
