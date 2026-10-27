@@ -5,6 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Runtime.InteropServices;
+using System.Net.Http;
+using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
@@ -18,6 +20,8 @@ namespace GVPN;
 
 public partial class MainWindow : Window
 {
+    private static readonly HttpClient UpdateHttpClient = new() { Timeout = TimeSpan.FromSeconds(8) };
+    private const string LatestReleaseApi = "https://api.github.com/repos/JuniorSantana93/GVPN/releases/latest";
     private readonly ProtonVpnService _proton = new();
     private readonly SavedProtonCredentials _savedCredentials = new();
     private readonly NetworkTunnelManager _tunnel = new();
@@ -40,6 +44,10 @@ public partial class MainWindow : Window
     private bool _waitingForCaptcha;
     private bool _saveLogin;
     private bool _isFree = true;
+    private bool _updateAvailable;
+    private string _updateStatus = "Atualização automática ativada. Será verificada ao iniciar.";
+    private string _latestVersion = "";
+    private string _latestReleaseUrl = "https://github.com/JuniorSantana93/GVPN/releases/latest";
     private bool _allowExit;
     private ProtonServer? _connectedServer;
     private DateTime _connectedAt;
@@ -89,6 +97,7 @@ public partial class MainWindow : Window
                 await LoadAccountAndServersAsync(sessionUser);
             }
             await PushWebStateAsync();
+            if (_settings.CheckUpdatesOnStartup) _ = CheckForUpdatesAsync(silent: true);
             ApplyStartMinimized();
         }
         catch (Exception ex)
@@ -99,7 +108,10 @@ public partial class MainWindow : Window
 
     private async Task InitializeWebViewAsync()
     {
-        await AppWebView.EnsureCoreWebView2Async();
+        string webViewDataFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GVPN", "WebView2");
+        Directory.CreateDirectory(webViewDataFolder);
+        var webViewEnvironment = await CoreWebView2Environment.CreateAsync(userDataFolder: webViewDataFolder);
+        await AppWebView.EnsureCoreWebView2Async(webViewEnvironment);
         AppWebView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
         AppWebView.CoreWebView2.Settings.AreDevToolsEnabled = false;
         AppWebView.CoreWebView2.WebMessageReceived += WebView_WebMessageReceived;
@@ -136,6 +148,8 @@ public partial class MainWindow : Window
                 case "remove-app": RemoveSplitApp(root); await PushWebStateAsync(); break;
                 case "logout": await LogoutAsync(); break;
                 case "save-settings": SaveSettings(root); await PushWebStateAsync(); break;
+                case "check-updates": await CheckForUpdatesAsync(silent: false); break;
+                case "open-update": OpenLatestRelease(); break;
                 case "account": ShowAccount(); break;
                 case "support": OpenSupport(); break;
                 case "minimize": WindowState = WindowState.Minimized; break;
@@ -290,6 +304,7 @@ public partial class MainWindow : Window
         await PushWebStateAsync();
         try
         {
+            RefreshDiscordSplitAppPaths();
             var generated = await _proton.GenerateProfileAsync(_username, server);
             if (!generated.Success) { _connectionStatus = "FALHA AO GERAR PERFIL"; _serverSummary = generated.Message; _connectedServer = null; return; }
 
@@ -364,8 +379,64 @@ public partial class MainWindow : Window
 
     private void LoadSplitApps()
     {
-        try { if (File.Exists(_splitAppsFile)) _tunneledApps.AddRange(JsonSerializer.Deserialize<List<string>>(File.ReadAllText(_splitAppsFile)) ?? new()); }
+        try
+        {
+            if (File.Exists(_splitAppsFile))
+            {
+                var configured = JsonSerializer.Deserialize<List<string>>(File.ReadAllText(_splitAppsFile)) ?? new();
+                _tunneledApps.AddRange(configured.Select(ResolveDiscordExecutable).Distinct(StringComparer.OrdinalIgnoreCase));
+                if (!_tunneledApps.SequenceEqual(configured, StringComparer.OrdinalIgnoreCase)) SaveSplitApps();
+            }
+        }
         catch { _tunneledApps.Clear(); }
+    }
+
+    private void RefreshDiscordSplitAppPaths()
+    {
+        bool changed = false;
+        for (int i = 0; i < _tunneledApps.Count; i++)
+        {
+            string resolved = ResolveDiscordExecutable(_tunneledApps[i]);
+            if (string.Equals(resolved, _tunneledApps[i], StringComparison.OrdinalIgnoreCase)) continue;
+            _tunneledApps[i] = resolved;
+            changed = true;
+        }
+        if (changed) SaveSplitApps();
+    }
+
+    private static string ResolveDiscordExecutable(string configuredPath)
+    {
+        string? fileName = Path.GetFileName(configuredPath);
+        string? installFolder = fileName?.ToLowerInvariant() switch
+        {
+            "discord.exe" => "Discord",
+            "discordptb.exe" => "DiscordPTB",
+            "discordcanary.exe" => "DiscordCanary",
+            _ => null
+        };
+        if (installFolder is null) return configuredPath;
+
+        string installRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), installFolder);
+        if (!Directory.Exists(installRoot)) return configuredPath;
+        try
+        {
+            var latest = Directory.EnumerateDirectories(installRoot, "app-*", SearchOption.TopDirectoryOnly)
+                .Select(directory => new { Directory = directory, Executable = Path.Combine(directory, fileName!) })
+                .Where(candidate => File.Exists(candidate.Executable))
+                .Select(candidate => new
+                {
+                    candidate.Executable,
+                    Version = Version.TryParse(Path.GetFileName(candidate.Directory).Substring("app-".Length), out var version) ? version : null,
+                    Modified = Directory.GetLastWriteTimeUtc(candidate.Directory)
+                })
+                .OrderByDescending(candidate => candidate.Version is not null)
+                .ThenByDescending(candidate => candidate.Version)
+                .ThenByDescending(candidate => candidate.Modified)
+                .FirstOrDefault();
+            return latest?.Executable ?? configuredPath;
+        }
+        catch (IOException) { return configuredPath; }
+        catch (UnauthorizedAccessException) { return configuredPath; }
     }
 
     private void SaveSplitApps()
@@ -444,11 +515,49 @@ public partial class MainWindow : Window
 
     private void SaveSettings(JsonElement root)
     {
-        _settings = new AppSettings { StartWithWindows = ReadBool(root, "startWithWindows"), StartMinimized = ReadBool(root, "startMinimized"), CloseToTray = ReadBool(root, "closeToTray") };
+        _settings = new AppSettings { StartWithWindows = ReadBool(root, "startWithWindows"), StartMinimized = ReadBool(root, "startMinimized"), CloseToTray = ReadBool(root, "closeToTray"), CheckUpdatesOnStartup = ReadBool(root, "checkUpdatesOnStartup") };
         Directory.CreateDirectory(Path.GetDirectoryName(_settingsFile)!);
         File.WriteAllText(_settingsFile, JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true }));
         SetStartWithWindows(_settings.StartWithWindows);
         if (_settings.CloseToTray) InitializeTrayIcon(); else { _trayIcon?.Dispose(); _trayIcon = null; }
+    }
+
+    private async Task CheckForUpdatesAsync(bool silent)
+    {
+        _updateStatus = "Verificando atualizações no GitHub…";
+        if (!silent) await PushWebStateAsync();
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, LatestReleaseApi);
+            request.Headers.UserAgent.ParseAdd("GVPN-Updater/1.0");
+            using var response = await UpdateHttpClient.SendAsync(request);
+            response.EnsureSuccessStatusCode();
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            string tag = json.RootElement.TryGetProperty("tag_name", out var tagValue) ? tagValue.GetString() ?? "" : "";
+            _latestReleaseUrl = json.RootElement.TryGetProperty("html_url", out var urlValue) ? urlValue.GetString() ?? "https://github.com/JuniorSantana93/GVPN/releases/latest" : "https://github.com/JuniorSantana93/GVPN/releases/latest";
+            _latestVersion = tag.TrimStart('v', 'V');
+            Version? current = Assembly.GetExecutingAssembly().GetName().Version;
+            bool hasCurrent = Version.TryParse(current?.ToString(3), out var currentVersion);
+            bool hasLatest = Version.TryParse(_latestVersion, out var latestVersion);
+            _updateAvailable = hasCurrent && hasLatest && latestVersion! > currentVersion!;
+            _updateStatus = _updateAvailable
+                ? $"Nova versão {_latestVersion} disponível (instalada: {currentVersion})."
+                : $"Você está usando a versão mais recente ({current?.ToString(3) ?? "desconhecida"}).";
+        }
+        catch (Exception ex)
+        {
+            _updateAvailable = false;
+            _updateStatus = "Não foi possível consultar o GitHub. Confira sua conexão e tente novamente.";
+            Debug.WriteLine($"Falha ao verificar atualizações: {ex.Message}");
+        }
+        await PushWebStateAsync();
+    }
+
+    private void OpenLatestRelease()
+    {
+        if (!Uri.TryCreate(_latestReleaseUrl, UriKind.Absolute, out var uri) || uri.Host != "github.com") return;
+        try { Process.Start(new ProcessStartInfo(uri.ToString()) { UseShellExecute = true }); }
+        catch (Exception ex) { MessageBox.Show($"Não foi possível abrir a página da atualização: {ex.Message}", "GVPN", MessageBoxButton.OK, MessageBoxImage.Warning); }
     }
 
     private void LoadAppSettings()
@@ -537,6 +646,9 @@ public partial class MainWindow : Window
             servers, selected = _selectedServer, sort = _sort, region = _region,
             apps = _tunneledApps.Select(path => new { path, name = Path.GetFileName(path), icon = GetAppIcon(path) }).ToArray(),
             settings = new { startWithWindows = _settings.StartWithWindows, startMinimized = _settings.StartMinimized, closeToTray = _settings.CloseToTray },
+            currentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "—",
+            checkUpdatesOnStartup = _settings.CheckUpdatesOnStartup, updateAvailable = _updateAvailable,
+            updateStatus = _updateStatus, latestVersion = _latestVersion,
             statusText = _serverSummary
         };
         AppWebView.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(new { type = "state", state }));
@@ -548,5 +660,6 @@ public partial class MainWindow : Window
         public bool StartWithWindows { get; set; }
         public bool StartMinimized { get; set; }
         public bool CloseToTray { get; set; }
+        public bool CheckUpdatesOnStartup { get; set; } = true;
     }
 }

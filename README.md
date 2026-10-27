@@ -11,6 +11,8 @@ Cliente de VPN para Windows com interface WebView2 e integração com uma conta 
 - Split tunneling por aplicativo.
 - IPv6 mantido ativo no Windows.
 - Interface responsiva em português, construída em HTML e WebView2.
+- Perfil WebView2 armazenado em `%LOCALAPPDATA%\GVPN\WebView2`.
+- Verificação de novas versões pelo GitHub ao iniciar, com consulta manual em Configurações.
 
 ## Requisitos
 
@@ -52,7 +54,7 @@ O resultado `publish/GVPN.exe` contém a interface, o helper Proton e as depend�
 
 ## Publicar uma versão
 
-Depois de enviar uma tag de versão, por exemplo `v1.0.0`, o workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) compila o helper Proton e o GVPN.exe self-contained para Windows x64 e anexa o executável a uma GitHub Release.
+Depois de enviar uma tag de versão, por exemplo `v1.1.0`, o workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) compila o helper Proton e o GVPN.exe self-contained para Windows x64 e anexa o executável a uma GitHub Release.
 
 ## Aviso de segurança e privacidade
 
