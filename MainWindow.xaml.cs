@@ -21,7 +21,7 @@ namespace GVPN;
 
 public partial class MainWindow : Window
 {
-    private static readonly HttpClient UpdateHttpClient = new() { Timeout = TimeSpan.FromSeconds(8) };
+    private static readonly HttpClient UpdateHttpClient = new() { Timeout = TimeSpan.FromSeconds(20) };
     private const string LatestReleaseApi = "https://api.github.com/repos/JuniorSantana93/GVPN/releases/latest";
     private readonly ProtonVpnService _proton = new();
     private readonly SavedProtonCredentials _savedCredentials = new();
@@ -119,6 +119,7 @@ public partial class MainWindow : Window
         try
         {
             await InitializeWebViewAsync();
+            if (_settings.CheckUpdatesOnStartup) _ = CheckForUpdatesAsync(silent: true);
             var saved = _savedCredentials.Load();
             _saveLogin = saved.HasValue;
             string? sessionUser = await _proton.GetStoredUsernameAsync();
@@ -128,7 +129,6 @@ public partial class MainWindow : Window
                 await LoadAccountAndServersAsync(sessionUser);
             }
             await PushWebStateAsync();
-            if (_settings.CheckUpdatesOnStartup) _ = CheckForUpdatesAsync(silent: true);
             ApplyStartMinimized();
         }
         catch (Exception ex)
@@ -560,16 +560,28 @@ public partial class MainWindow : Window
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, LatestReleaseApi);
-            request.Headers.UserAgent.ParseAdd("GVPN-Updater/1.0");
+            request.Headers.UserAgent.ParseAdd("GVPN-Updater/1.1");
+            request.Headers.Accept.ParseAdd("application/vnd.github+json");
+            request.Headers.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28");
             using var response = await UpdateHttpClient.SendAsync(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                _updateAvailable = false;
+                _updateStatus = $"GitHub respondeu HTTP {(int)response.StatusCode} ({response.ReasonPhrase}). Tente novamente mais tarde.";
+                Debug.WriteLine($"Falha ao verificar atualizações: HTTP {(int)response.StatusCode} ({response.ReasonPhrase}).");
+                await PushWebStateAsync();
+                return;
+            }
             response.EnsureSuccessStatusCode();
             using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
             string tag = json.RootElement.TryGetProperty("tag_name", out var tagValue) ? tagValue.GetString() ?? "" : "";
+            if (string.IsNullOrWhiteSpace(tag)) throw new InvalidDataException("A resposta da API não contém a tag da release.");
             _latestReleaseUrl = json.RootElement.TryGetProperty("html_url", out var urlValue) ? urlValue.GetString() ?? "https://github.com/JuniorSantana93/GVPN/releases/latest" : "https://github.com/JuniorSantana93/GVPN/releases/latest";
             _latestVersion = tag.TrimStart('v', 'V');
             Version? current = Assembly.GetExecutingAssembly().GetName().Version;
             bool hasCurrent = Version.TryParse(current?.ToString(3), out var currentVersion);
             bool hasLatest = Version.TryParse(_latestVersion, out var latestVersion);
+            if (!hasCurrent || !hasLatest) throw new InvalidDataException($"Não foi possível interpretar as versões (instalada: {current}; GitHub: {tag}).");
             _updateAvailable = hasCurrent && hasLatest && latestVersion! > currentVersion!;
             _updateStatus = _updateAvailable
                 ? $"Nova versão {_latestVersion} disponível (instalada: {currentVersion})."
@@ -578,7 +590,14 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             _updateAvailable = false;
-            _updateStatus = "Não foi possível consultar o GitHub. Confira sua conexão e tente novamente.";
+            _updateStatus = ex switch
+            {
+                TaskCanceledException => "A consulta ao GitHub expirou após 20 segundos. Confira sua conexão e tente novamente.",
+                HttpRequestException { StatusCode: not null } httpError => $"Falha de comunicação com o GitHub (HTTP {(int)httpError.StatusCode}: {httpError.Message}).",
+                HttpRequestException => $"Não foi possível alcançar a API do GitHub: {ex.Message}",
+                JsonException => "O GitHub respondeu, mas os dados da release estavam inválidos.",
+                _ => $"Não foi possível verificar atualizações: {ex.Message}"
+            };
             Debug.WriteLine($"Falha ao verificar atualizações: {ex.Message}");
         }
         await PushWebStateAsync();
@@ -676,7 +695,7 @@ public partial class MainWindow : Window
             status = _connectionStatus, duration = ConnectionDuration, activeServer = active,
             servers, selected = _selectedServer, sort = _sort, region = _region,
             apps = _tunneledApps.Select(path => new { path, name = Path.GetFileName(path), icon = GetAppIcon(path) }).ToArray(),
-            settings = new { startWithWindows = _settings.StartWithWindows, startMinimized = _settings.StartMinimized, closeToTray = _settings.CloseToTray },
+            settings = new { startWithWindows = _settings.StartWithWindows, startMinimized = _settings.StartMinimized, closeToTray = _settings.CloseToTray, checkUpdatesOnStartup = _settings.CheckUpdatesOnStartup },
             currentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "—",
             checkUpdatesOnStartup = _settings.CheckUpdatesOnStartup, updateAvailable = _updateAvailable,
             updateStatus = _updateStatus, latestVersion = _latestVersion,
