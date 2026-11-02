@@ -211,7 +211,7 @@ public partial class MainWindow : Window
                 case "add-app": AddSplitApp(); await PushWebStateAsync(); break;
                 case "remove-app": RemoveSplitApp(root); await PushWebStateAsync(); break;
                 case "logout": await LogoutAsync(); break;
-                case "save-settings": await SaveSettingsAsync(root); break;
+                case "update-setting": await UpdateSettingAsync(root); break;
                 case "check-updates": await CheckForUpdatesAsync(silent: false); break;
                 case "open-update": OpenLatestRelease(); break;
                 case "update-app": await DownloadAndInstallUpdateAsync(); break;
@@ -578,29 +578,39 @@ public partial class MainWindow : Window
     private static extern IntPtr SHGetFileInfo(string path, uint attributes, ref ShellFileInfo info, uint fileInfoSize, uint flags);
     [DllImport("user32.dll")] private static extern bool DestroyIcon(IntPtr handle);
 
-    private void SaveSettings(JsonElement root)
+    private async Task UpdateSettingAsync(JsonElement root)
     {
-        _settings = new AppSettings { StartWithWindows = ReadBool(root, "startWithWindows"), StartMinimized = ReadBool(root, "startMinimized"), CloseToTray = ReadBool(root, "closeToTray"), CheckUpdatesOnStartup = ReadBool(root, "checkUpdatesOnStartup") };
-        Directory.CreateDirectory(Path.GetDirectoryName(_settingsFile)!);
-        File.WriteAllText(_settingsFile, JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true }));
-        SetStartWithWindows(_settings.StartWithWindows);
-        if (_settings.CloseToTray) InitializeTrayIcon(); else { _trayIcon?.Dispose(); _trayIcon = null; }
-    }
+        string name = ReadString(root, "name");
+        bool value = ReadBool(root, "value");
+        switch (name)
+        {
+            case "startWithWindows": _settings.StartWithWindows = value; break;
+            case "startMinimized": _settings.StartMinimized = value; break;
+            case "closeToTray": _settings.CloseToTray = value; break;
+            case "checkUpdatesOnStartup": _settings.CheckUpdatesOnStartup = value; break;
+            default: return;
+        }
 
-    private async Task SaveSettingsAsync(JsonElement root)
-    {
         _settingsSaveError = "";
         try
         {
-            SaveSettings(root);
+            PersistSettings();
             _settingsSaveRevision++;
         }
         catch (Exception ex)
         {
             _settingsSaveError = ex.Message;
-            Debug.WriteLine($"Falha ao salvar configurações: {ex}");
+            Debug.WriteLine($"Falha ao salvar configuração '{name}': {ex}");
         }
         await PushWebStateAsync();
+    }
+
+    private void PersistSettings()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_settingsFile)!);
+        File.WriteAllText(_settingsFile, JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true }));
+        SetStartWithWindows(_settings.StartWithWindows);
+        if (_settings.CloseToTray) InitializeTrayIcon(); else { _trayIcon?.Dispose(); _trayIcon = null; }
     }
 
     private async Task CheckForUpdatesAsync(bool silent)
