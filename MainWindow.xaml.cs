@@ -23,6 +23,33 @@ public partial class MainWindow : Window
 {
     private static readonly HttpClient UpdateHttpClient = new() { Timeout = TimeSpan.FromSeconds(20) };
     private const string LatestReleaseApi = "https://api.github.com/repos/JuniorSantana93/GVPN/releases/latest";
+    private const string UpdateScript = """
+        param([int]$ProcessId,[string]$DownloadedPath,[string]$TargetPath,[string]$BackupPath)
+        $ErrorActionPreference = 'Stop'
+        try {
+            try { Wait-Process -Id $ProcessId -ErrorAction Stop } catch { }
+            if (-not (Test-Path -LiteralPath $DownloadedPath -PathType Leaf)) { throw 'O executável baixado não foi encontrado.' }
+            if (-not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) { throw 'O executável atual não foi encontrado.' }
+            Move-Item -LiteralPath $TargetPath -Destination $BackupPath -Force
+            try {
+                Move-Item -LiteralPath $DownloadedPath -Destination $TargetPath -Force
+                Start-Process -FilePath $TargetPath
+                Remove-Item -LiteralPath $BackupPath -Force
+            }
+            catch {
+                if (Test-Path -LiteralPath $TargetPath) { Remove-Item -LiteralPath $TargetPath -Force }
+                if (Test-Path -LiteralPath $BackupPath) { Move-Item -LiteralPath $BackupPath -Destination $TargetPath -Force }
+                throw
+            }
+        }
+        catch {
+            Add-Type -AssemblyName System.Windows.Forms
+            [System.Windows.Forms.MessageBox]::Show("Não foi possível concluir a atualização do GVPN. O executável anterior foi restaurado quando possível.`n`n$($_.Exception.Message)", 'Atualização do GVPN', 'OK', 'Error') | Out-Null
+        }
+        finally {
+            if (Test-Path -LiteralPath $DownloadedPath) { Remove-Item -LiteralPath $DownloadedPath -Force -ErrorAction SilentlyContinue }
+        }
+        """;
     private readonly ProtonVpnService _proton = new();
     private readonly SavedProtonCredentials _savedCredentials = new();
     private readonly NetworkTunnelManager _tunnel = new();
@@ -46,9 +73,15 @@ public partial class MainWindow : Window
     private bool _saveLogin;
     private bool _isFree = true;
     private bool _updateAvailable;
+    private bool _updateApplying;
     private string _updateStatus = "Atualização automática ativada. Será verificada ao iniciar.";
     private string _latestVersion = "";
     private string _latestReleaseUrl = "https://github.com/JuniorSantana93/GVPN/releases/latest";
+    private string _latestAssetDownloadUrl = "";
+    private string _latestAssetSha256 = "";
+    private long _latestAssetSize;
+    private long _settingsSaveRevision;
+    private string _settingsSaveError = "";
     private bool _allowExit;
     private ProtonServer? _connectedServer;
     private DateTime _connectedAt;
@@ -178,9 +211,10 @@ public partial class MainWindow : Window
                 case "add-app": AddSplitApp(); await PushWebStateAsync(); break;
                 case "remove-app": RemoveSplitApp(root); await PushWebStateAsync(); break;
                 case "logout": await LogoutAsync(); break;
-                case "save-settings": SaveSettings(root); await PushWebStateAsync(); break;
+                case "save-settings": await SaveSettingsAsync(root); break;
                 case "check-updates": await CheckForUpdatesAsync(silent: false); break;
                 case "open-update": OpenLatestRelease(); break;
+                case "update-app": await DownloadAndInstallUpdateAsync(); break;
                 case "account": ShowAccount(); break;
                 case "support": OpenSupport(); break;
                 case "minimize": WindowState = WindowState.Minimized; break;
@@ -553,6 +587,22 @@ public partial class MainWindow : Window
         if (_settings.CloseToTray) InitializeTrayIcon(); else { _trayIcon?.Dispose(); _trayIcon = null; }
     }
 
+    private async Task SaveSettingsAsync(JsonElement root)
+    {
+        _settingsSaveError = "";
+        try
+        {
+            SaveSettings(root);
+            _settingsSaveRevision++;
+        }
+        catch (Exception ex)
+        {
+            _settingsSaveError = ex.Message;
+            Debug.WriteLine($"Falha ao salvar configurações: {ex}");
+        }
+        await PushWebStateAsync();
+    }
+
     private async Task CheckForUpdatesAsync(bool silent)
     {
         _updateStatus = "Verificando atualizações no GitHub…";
@@ -577,6 +627,21 @@ public partial class MainWindow : Window
             string tag = json.RootElement.TryGetProperty("tag_name", out var tagValue) ? tagValue.GetString() ?? "" : "";
             if (string.IsNullOrWhiteSpace(tag)) throw new InvalidDataException("A resposta da API não contém a tag da release.");
             _latestReleaseUrl = json.RootElement.TryGetProperty("html_url", out var urlValue) ? urlValue.GetString() ?? "https://github.com/JuniorSantana93/GVPN/releases/latest" : "https://github.com/JuniorSantana93/GVPN/releases/latest";
+            _latestAssetDownloadUrl = "";
+            _latestAssetSha256 = "";
+            _latestAssetSize = 0;
+            if (json.RootElement.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var asset in assets.EnumerateArray())
+                {
+                    if (!asset.TryGetProperty("name", out var assetName) || !string.Equals(assetName.GetString(), "GVPN.exe", StringComparison.OrdinalIgnoreCase)) continue;
+                    _latestAssetDownloadUrl = asset.TryGetProperty("browser_download_url", out var downloadUrl) ? downloadUrl.GetString() ?? "" : "";
+                    string digest = asset.TryGetProperty("digest", out var digestValue) ? digestValue.GetString() ?? "" : "";
+                    _latestAssetSha256 = digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase) ? digest[7..] : "";
+                    _latestAssetSize = asset.TryGetProperty("size", out var sizeValue) && sizeValue.TryGetInt64(out long size) ? size : 0;
+                    break;
+                }
+            }
             _latestVersion = tag.TrimStart('v', 'V');
             Version? current = Assembly.GetExecutingAssembly().GetName().Version;
             bool hasCurrent = Version.TryParse(current?.ToString(3), out var currentVersion);
@@ -584,7 +649,9 @@ public partial class MainWindow : Window
             if (!hasCurrent || !hasLatest) throw new InvalidDataException($"Não foi possível interpretar as versões (instalada: {current}; GitHub: {tag}).");
             _updateAvailable = hasCurrent && hasLatest && latestVersion! > currentVersion!;
             _updateStatus = _updateAvailable
-                ? $"Nova versão {_latestVersion} disponível (instalada: {currentVersion})."
+                ? string.IsNullOrWhiteSpace(_latestAssetDownloadUrl) || string.IsNullOrWhiteSpace(_latestAssetSha256)
+                    ? $"A versão {_latestVersion} está disponível, mas o executável ou seu SHA-256 não foi publicado corretamente."
+                    : $"Nova versão {_latestVersion} disponível (instalada: {currentVersion})."
                 : $"Você está usando a versão mais recente ({current?.ToString(3) ?? "desconhecida"}).";
         }
         catch (Exception ex)
@@ -601,6 +668,94 @@ public partial class MainWindow : Window
             Debug.WriteLine($"Falha ao verificar atualizações: {ex.Message}");
         }
         await PushWebStateAsync();
+    }
+
+    private async Task DownloadAndInstallUpdateAsync()
+    {
+        if (_updateApplying) return;
+        if (!_updateAvailable || string.IsNullOrWhiteSpace(_latestAssetDownloadUrl) || string.IsNullOrWhiteSpace(_latestAssetSha256))
+        {
+            _updateStatus = "Faça uma nova verificação e confirme que a release contém GVPN.exe e o SHA-256.";
+            await PushWebStateAsync();
+            return;
+        }
+        if (_tunnel.IsConnected)
+        {
+            _updateStatus = "Desconecte a VPN antes de atualizar o aplicativo.";
+            await PushWebStateAsync();
+            return;
+        }
+        if (!Uri.TryCreate(_latestAssetDownloadUrl, UriKind.Absolute, out var downloadUri) || downloadUri.Scheme != Uri.UriSchemeHttps || downloadUri.Host != "github.com")
+        {
+            _updateStatus = "O endereço do executável da release não é válido.";
+            await PushWebStateAsync();
+            return;
+        }
+
+        _updateApplying = true;
+        _updateStatus = $"Baixando a versão {_latestVersion}… O GVPN será reiniciado para substituir o executável.";
+        await PushWebStateAsync();
+        string? stagedPath = null;
+        try
+        {
+            string targetPath = Environment.ProcessPath ?? throw new InvalidOperationException("Não foi possível localizar o executável em execução.");
+            string updateDirectory = Path.Combine(Path.GetTempPath(), $"GVPN-update-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(updateDirectory);
+            stagedPath = Path.Combine(updateDirectory, "GVPN.exe.download");
+
+            using var response = await UpdateHttpClient.GetAsync(downloadUri, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+            await using (var output = new FileStream(stagedPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, useAsync: true))
+            await using (var input = await response.Content.ReadAsStreamAsync())
+                await input.CopyToAsync(output);
+
+            var fileInfo = new FileInfo(stagedPath);
+            if (_latestAssetSize > 0 && fileInfo.Length != _latestAssetSize)
+                throw new InvalidDataException($"O tamanho do arquivo baixado ({fileInfo.Length} bytes) não corresponde ao publicado ({_latestAssetSize} bytes).");
+            await using (var verifyStream = File.OpenRead(stagedPath))
+            {
+                byte[] hash = await System.Security.Cryptography.SHA256.HashDataAsync(verifyStream);
+                string actualDigest = Convert.ToHexString(hash);
+                if (!actualDigest.Equals(_latestAssetSha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("A verificação SHA-256 do executável falhou. A versão baixada foi descartada.");
+            }
+
+            string backupPath = targetPath + ".previous";
+            string scriptPath = Path.Combine(updateDirectory, "apply-update.ps1");
+            await File.WriteAllTextAsync(scriptPath, UpdateScript);
+            var helper = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+            helper.ArgumentList.Add("-NoProfile");
+            helper.ArgumentList.Add("-NonInteractive");
+            helper.ArgumentList.Add("-ExecutionPolicy");
+            helper.ArgumentList.Add("Bypass");
+            helper.ArgumentList.Add("-File");
+            helper.ArgumentList.Add(scriptPath);
+            helper.ArgumentList.Add(Environment.ProcessId.ToString());
+            helper.ArgumentList.Add(stagedPath);
+            helper.ArgumentList.Add(targetPath);
+            helper.ArgumentList.Add(backupPath);
+            using var updaterProcess = Process.Start(helper) ?? throw new InvalidOperationException("Não foi possível iniciar o atualizador.");
+            _allowExit = true;
+            Close();
+        }
+        catch (Exception ex)
+        {
+            _updateApplying = false;
+            _updateStatus = $"Falha ao preparar a atualização: {ex.Message}";
+            Debug.WriteLine($"Falha ao preparar atualização: {ex}");
+            if (stagedPath is not null)
+            {
+                try { File.Delete(stagedPath); Directory.Delete(Path.GetDirectoryName(stagedPath)!, recursive: true); }
+                catch { }
+            }
+            await PushWebStateAsync();
+        }
     }
 
     private void OpenLatestRelease()
@@ -696,8 +851,11 @@ public partial class MainWindow : Window
             servers, selected = _selectedServer, sort = _sort, region = _region,
             apps = _tunneledApps.Select(path => new { path, name = Path.GetFileName(path), icon = GetAppIcon(path) }).ToArray(),
             settings = new { startWithWindows = _settings.StartWithWindows, startMinimized = _settings.StartMinimized, closeToTray = _settings.CloseToTray, checkUpdatesOnStartup = _settings.CheckUpdatesOnStartup },
+            settingsSaveRevision = _settingsSaveRevision, settingsSaveError = _settingsSaveError,
             currentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "—",
             checkUpdatesOnStartup = _settings.CheckUpdatesOnStartup, updateAvailable = _updateAvailable,
+            updateCanInstall = _updateAvailable && !string.IsNullOrWhiteSpace(_latestAssetDownloadUrl) && !string.IsNullOrWhiteSpace(_latestAssetSha256),
+            updateApplying = _updateApplying,
             updateStatus = _updateStatus, latestVersion = _latestVersion,
             statusText = _serverSummary
         };
