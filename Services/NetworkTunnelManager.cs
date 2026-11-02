@@ -21,7 +21,13 @@ namespace GVPN.Services
         private string? _wireGuardExe;
         private string? _wireSockExe;
         private Process? _wireSockProcess;
+        private bool _usingWireSock;
         private int _intentionalWireSockExit;
+        private int _recoveringTunnel;
+        private CancellationTokenSource? _healthMonitorCancellation;
+        private TunnelProbeTarget? _activeProbe;
+        private string _activeConfigPath = "";
+        private readonly SemaphoreSlim _disconnectGate = new(1, 1);
         public bool IsConnected { get; private set; }
         public bool HasWireSock => FindWireSockExecutable() is not null;
         public event EventHandler<string>? ConnectionLost;
@@ -92,14 +98,31 @@ namespace GVPN.Services
                     return (false, "Não foi possível confirmar o acesso à internet antes da VPN. Verifique a conexão e tente novamente.");
 
                 _wireSockExe = FindWireSockExecutable();
+                _usingWireSock = _wireSockExe is not null;
                 if (_wireSockExe != null)
                 {
+                    _activeConfigPath = configPath;
+                    _activeProbe = probe;
                     var result = await ConnectWithWireSockAsync(configPath, tunneledApps ?? Array.Empty<string>());
-                    if (!result.Success) return result;
+                    if (!result.Success)
+                    {
+                        await DisconnectAsync(configPath);
+                        bool restoredAfterStartFailure = await WaitForNormalInternetAsync(probe);
+                        return (false, result.StatusMessage + " " + (restoredAfterStartFailure
+                            ? "A conexão normal com a internet foi restaurada."
+                            : "Não foi possível confirmar a restauração da internet; reinicie a conexão de rede do Windows."));
+                    }
                     var verification = await VerifyTunnelAsync(probe);
-                    if (verification.Success) return (true, $"{result.StatusMessage} {verification.Message}");
+                    if (verification.Success)
+                    {
+                        StartConnectionHealthMonitor(configPath, probe);
+                        return (true, $"{result.StatusMessage} {verification.Message}");
+                    }
                     await DisconnectAsync(configPath);
-                    return (false, $"{verification.Message} O túnel foi encerrado para restaurar a conexão normal.");
+                    bool restored = await WaitForNormalInternetAsync(probe);
+                    return (false, $"{verification.Message} O túnel foi encerrado. " + (restored
+                        ? "A conexão normal com a internet foi restaurada."
+                        : "Não foi possível confirmar a restauração da internet; reinicie a conexão de rede do Windows."));
                 }
 
                 if (tunneledApps is { Count: > 0 })
@@ -134,42 +157,66 @@ namespace GVPN.Services
             }
             catch (Exception ex)
             {
+                if (_usingWireSock)
+                {
+                    try { await DisconnectAsync(configPath); } catch { }
+                }
                 return (false, $"Falha ao iniciar WireGuard: {ex.Message}");
             }
         }
 
         public async Task DisconnectAsync(string configPath)
         {
-            if (_wireSockProcess is { } wsProcess)
+            await _disconnectGate.WaitAsync();
+            try
             {
-                Interlocked.Exchange(ref _intentionalWireSockExit, 1);
-                try
+                StopConnectionHealthMonitor();
+                if (_usingWireSock || _wireSockProcess is not null)
                 {
-                    if (!wsProcess.HasExited) wsProcess.Kill(entireProcessTree: true);
-                    using var timeout = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(10));
-                    await wsProcess.WaitForExitAsync(timeout.Token);
+                    if (_wireSockProcess is { } wsProcess)
+                    {
+                        Interlocked.Exchange(ref _intentionalWireSockExit, 1);
+                        try
+                        {
+                            if (!wsProcess.HasExited) wsProcess.Kill(entireProcessTree: true);
+                            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                            await wsProcess.WaitForExitAsync(timeout.Token);
+                        }
+                        catch (InvalidOperationException) { }
+                        catch (TaskCanceledException) { }
+                        finally
+                        {
+                            wsProcess.Dispose();
+                            _wireSockProcess = null;
+                            Interlocked.Exchange(ref _intentionalWireSockExit, 0);
+                        }
+                    }
+                    _usingWireSock = false;
+                    _activeProbe = null;
+                    _activeConfigPath = "";
+                    IsConnected = false;
+                    TryDelete(Path.Combine(Path.GetDirectoryName(configPath)!, "GVPN_Tunnel_Split.conf"));
+                    return;
                 }
-                catch (InvalidOperationException) { }
-                catch (System.Threading.Tasks.TaskCanceledException) { }
-                finally { wsProcess.Dispose(); _wireSockProcess = null; Interlocked.Exchange(ref _intentionalWireSockExit, 0); }
-                TryDelete(Path.Combine(Path.GetDirectoryName(configPath)!, "GVPN_Tunnel_Split.conf"));
+                string name = Path.GetFileNameWithoutExtension(configPath);
+                string? exe = _wireGuardExe ?? FindWireGuardExecutable();
+                if (exe != null && !string.IsNullOrWhiteSpace(name))
+                {
+                    await RunProcessAsync(exe, $"/uninstalltunnelservice \"{name}\"", 15000);
+                    string service = "WireGuardTunnel$" + name;
+                    for (int i = 0; i < 10; i++)
+                    {
+                        var result = await RunProcessAsync("sc.exe", $"query \"{service}\"", 5000);
+                        if (result.ExitCode != 0 || result.Output.Contains("STOPPED", StringComparison.OrdinalIgnoreCase)) break;
+                        await Task.Delay(300);
+                    }
+                }
+            }
+            finally
+            {
                 IsConnected = false;
-                return;
+                _disconnectGate.Release();
             }
-            string name = Path.GetFileNameWithoutExtension(configPath);
-            string? exe = _wireGuardExe ?? FindWireGuardExecutable();
-            if (exe != null && !string.IsNullOrWhiteSpace(name))
-            {
-                await RunProcessAsync(exe, $"/uninstalltunnelservice \"{name}\"", 15000);
-                string service = "WireGuardTunnel$" + name;
-                for (int i = 0; i < 10; i++)
-                {
-                    var result = await RunProcessAsync("sc.exe", $"query \"{service}\"", 5000);
-                    if (result.ExitCode != 0 || result.Output.Contains("STOPPED", StringComparison.OrdinalIgnoreCase)) break;
-                    await Task.Delay(300);
-                }
-            }
-            IsConnected = false;
         }
 
         private async Task<(bool Success, string StatusMessage)> ConnectWithWireSockAsync(string configPath, IReadOnlyList<string> tunneledApps)
@@ -194,34 +241,26 @@ namespace GVPN.Services
 
             var process = new Process { StartInfo = start, EnableRaisingEvents = true };
             process.Exited += WireSockProcess_Exited;
-            process.Start();
             _wireSockProcess = process;
+            try { process.Start(); }
+            catch
+            {
+                _wireSockProcess = null;
+                process.Dispose();
+                throw;
+            }
             _ = process.StandardOutput.ReadToEndAsync();
             _ = process.StandardError.ReadToEndAsync();
             await Task.Delay(TimeSpan.FromSeconds(3));
             if (process.HasExited)
             {
                 int exitCode = process.ExitCode;
+                _wireSockProcess = null;
+                IsConnected = false;
                 process.Dispose();
                 return (false, $"WireSock encerrou durante a conexão (código {exitCode}). Confira se o driver do WireSock está instalado e ativo.");
             }
-            if (process.HasExited)
-            {
-                int exitCode = process.ExitCode;
-                _wireSockProcess = null;
-                IsConnected = false;
-                process.Dispose();
-                return (false, $"WireSock encerrou durante a inicialização (código {exitCode}). Confira se o driver do WireSock está instalado e ativo.");
-            }
             IsConnected = true;
-            if (process.HasExited)
-            {
-                int exitCode = process.ExitCode;
-                IsConnected = false;
-                _wireSockProcess = null;
-                process.Dispose();
-                return (false, $"WireSock encerrou durante a inicialização (código {exitCode}). Confira se o driver do WireSock está instalado e ativo.");
-            }
             return (true, tunneledApps.Count > 0
                 ? $"WireSock conectado. Split Tunneling ativo para {tunneledApps.Count} programa(s); IPv6 segue pelo perfil Proton e nenhuma configuração IPv6 do Windows foi alterada."
                 : "WireSock conectado em túnel completo; IPv6 segue pelo perfil Proton e nenhuma configuração IPv6 do Windows foi alterada.");
@@ -294,6 +333,91 @@ namespace GVPN.Services
             return (false, "O túnel iniciou, mas a verificação não confirmou saída de internet pela VPN ou o IP de saída não mudou.");
         }
 
+        private void StartConnectionHealthMonitor(string configPath, TunnelProbeTarget probe)
+        {
+            StopConnectionHealthMonitor();
+            var cancellation = new CancellationTokenSource();
+            _healthMonitorCancellation = cancellation;
+            _ = MonitorConnectionHealthAsync(configPath, probe, cancellation);
+        }
+
+        private void StopConnectionHealthMonitor()
+        {
+            var cancellation = _healthMonitorCancellation;
+            _healthMonitorCancellation = null;
+            if (cancellation is null) return;
+            try { cancellation.Cancel(); } catch (ObjectDisposedException) { }
+        }
+
+        private async Task MonitorConnectionHealthAsync(string configPath, TunnelProbeTarget probe, CancellationTokenSource cancellation)
+        {
+            int failedProbes = 0;
+            try
+            {
+                while (!cancellation.IsCancellationRequested)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(12), cancellation.Token);
+                    if (!IsConnected) return;
+                    var process = _wireSockProcess;
+                    if (process is null) return;
+                    try { if (process.HasExited) return; }
+                    catch (ObjectDisposedException) { return; }
+                    catch (InvalidOperationException) { return; }
+
+                    string? currentIp = null;
+                    try { currentIp = await RequestPublicIpAsync(probe.Address, cancellation.Token); }
+                    catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
+                    catch { }
+
+                    if (currentIp is not null && !string.Equals(currentIp, probe.BaselineIp, StringComparison.Ordinal))
+                    {
+                        failedProbes = 0;
+                        continue;
+                    }
+
+                    failedProbes++;
+                    if (failedProbes < 3) continue;
+                    if (Interlocked.Exchange(ref _recoveringTunnel, 1) != 0) return;
+
+                    try
+                    {
+                        await DisconnectAsync(configPath);
+                        bool restored = await WaitForNormalInternetAsync(probe);
+                        ConnectionLost?.Invoke(this, restored
+                            ? "O túnel perdeu acesso à internet em três verificações seguidas. O WireSock foi encerrado e a conexão normal foi restaurada."
+                            : "O túnel perdeu acesso à internet em três verificações seguidas. O WireSock foi encerrado, mas não foi possível confirmar a restauração. Reinicie a conexão de rede do Windows.");
+                    }
+                    catch (Exception ex)
+                    {
+                        ConnectionLost?.Invoke(this, $"O túnel perdeu acesso à internet e a recuperação automática falhou: {ex.Message}");
+                    }
+                    finally { Interlocked.Exchange(ref _recoveringTunnel, 0); }
+                    return;
+                }
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+            finally
+            {
+                if (ReferenceEquals(_healthMonitorCancellation, cancellation)) _healthMonitorCancellation = null;
+                cancellation.Dispose();
+            }
+        }
+
+        private static async Task<bool> WaitForNormalInternetAsync(TunnelProbeTarget probe)
+        {
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(2));
+                try
+                {
+                    string? currentIp = await RequestPublicIpAsync(probe.Address, CancellationToken.None);
+                    if (string.Equals(currentIp, probe.BaselineIp, StringComparison.Ordinal)) return true;
+                }
+                catch { }
+            }
+            return false;
+        }
+
         private static string GetCurrentExecutablePath()
         {
             string? executable = Environment.ProcessPath;
@@ -306,9 +430,24 @@ namespace GVPN.Services
             if (sender is not Process process || Volatile.Read(ref _intentionalWireSockExit) != 0 || !ReferenceEquals(_wireSockProcess, process)) return;
             int exitCode;
             try { exitCode = process.ExitCode; } catch { exitCode = -1; }
+            bool wasConnected = IsConnected;
             _wireSockProcess = null;
             IsConnected = false;
-            ConnectionLost?.Invoke(this, $"O processo WireSock encerrou inesperadamente (código {exitCode}); o túnel não está mais ativo.");
+            StopConnectionHealthMonitor();
+            TryDelete(Path.Combine(Path.GetDirectoryName(_activeConfigPath) ?? "", "GVPN_Tunnel_Split.conf"));
+            var probe = _activeProbe;
+            ConnectionLost?.Invoke(this, wasConnected
+                ? $"O processo WireSock encerrou inesperadamente (código {exitCode}); verificando a recuperação da internet."
+                : $"O processo WireSock encerrou durante a conexão (código {exitCode}).");
+            if (wasConnected && probe is not null) _ = ReportUnexpectedWireSockExitAsync(probe, exitCode);
+        }
+
+        private async Task ReportUnexpectedWireSockExitAsync(TunnelProbeTarget probe, int exitCode)
+        {
+            bool restored = await WaitForNormalInternetAsync(probe);
+            ConnectionLost?.Invoke(this, restored
+                ? $"O WireSock encerrou inesperadamente (código {exitCode}), mas a conexão normal com a internet foi restaurada."
+                : $"O WireSock encerrou inesperadamente (código {exitCode}) e a internet não voltou. Reinicie a conexão de rede do Windows.");
         }
 
         private static string ApplySplitTunnelApps(string config, IReadOnlyList<string> apps)
