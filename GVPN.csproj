@@ -1,5 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
-
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
@@ -8,7 +7,7 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>GVPN</AssemblyName>
-    <Version>1.1.5</Version>
+    <Version>1.1.6</Version>
     <RootNamespace>GVPN</RootNamespace>
     <ApplicationIcon>Assets\GVPN.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -20,18 +19,9 @@
     <DebugSymbols>false</DebugSymbols>
     <DebugType>none</DebugType>
   </PropertyGroup>
-
-  <ItemGroup>
-    <Compile Remove="obj\**\*.cs" />
-    <Compile Remove="GVPN_Portable\**\*.cs" />
-    <Compile Remove="GVPN_ReviewBuild_20261020\**\*.cs" />
-    <Compile Remove=".gopath\**\*.cs" />
-  </ItemGroup>
-
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31" />
   </ItemGroup>
-
   <ItemGroup>
     <None Remove="Web\index.html" />
     <EmbeddedResource Include="Web\index.html" LogicalName="GVPN.Embedded.Web.index.html" />
@@ -42,11 +32,9 @@
     <EmbeddedResource Include="ThirdParty\proton-confgen-source.zip" LogicalName="GVPN.Embedded.licenses.proton-confgen-source.zip" />
     <EmbeddedResource Include="THIRD-PARTY-NOTICES.md" LogicalName="GVPN.Embedded.licenses.THIRD-PARTY-NOTICES.md" />
   </ItemGroup>
-
   <Target Name="RemoveWebView2DocumentationFromPublish" AfterTargets="ComputeFilesToPublish">
     <ItemGroup>
       <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="'%(ResolvedFileToPublish.Extension)' == '.xml' and $([System.String]::Copy('%(ResolvedFileToPublish.Filename)').StartsWith('Microsoft.Web.WebView2.'))" />
     </ItemGroup>
   </Target>
-
 </Project>

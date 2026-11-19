@@ -4,6 +4,20 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_call:
+    inputs:
+      ref:
+        description: Ref to build (used by the scheduled updater)
+        required: false
+        type: string
+      tag_name:
+        description: Release tag (used by the scheduled updater)
+        required: false
+        type: string
+      proton_version:
+        description: Validated Proton Linux client version
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -14,18 +28,42 @@ jobs:
     steps:
       - name: Baixar o código
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - name: Configurar Go
         uses: actions/setup-go@v7
         with:
           go-version-file: ThirdParty/proton-confgen/go.mod
-      - name: Compilar helper Proton
+      - name: Obter e validar versão atual do helper Proton
+        id: proton
+        shell: pwsh
+        env:
+          PROTON_VERSION_INPUT: ${{ inputs.proton_version }}
+        run: |
+          $version = $env:PROTON_VERSION_INPUT
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $response = Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/ProtonVPN/proton-vpn-gtk-app/stable/versions.yml' -TimeoutSec 30
+            if ($response.StatusCode -ne 200) { throw 'A fonte oficial da versão Proton não respondeu com HTTP 200.' }
+            $match = [regex]::Match($response.Content, '(?m)^version:\s*(\d+\.\d+\.\d+)\s*$')
+            if (-not $match.Success) { throw 'A resposta da Proton não contém uma versão X.Y.Z válida.' }
+            $version = $match.Groups[1].Value
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Versão Proton inválida: '$version'." }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Compilando helper com Proton $version"
+      - name: Compilar helper Proton com a versão upstream
         working-directory: ThirdParty/proton-confgen
         shell: pwsh
+        env:
+          PROTON_VERSION: ${{ steps.proton.outputs.version }}
         run: |
           New-Item -ItemType Directory -Force -Path build | Out-Null
+          $version = $env:PROTON_VERSION
+          $ldflags = "-X 'proton-vpn-wg-confgen/internal/constants.AppVersion=linux-vpn@$version' -X 'proton-vpn-wg-confgen/internal/constants.UserAgent=ProtonVPN/$version (Linux; Ubuntu)'"
           $env:GOOS = 'windows'
           $env:GOARCH = 'amd64'
-          go build -o build/proton-confgen.exe ./cmd/protonvpn-wg/main.go
+          go build -ldflags $ldflags -o build/proton-confgen.exe ./cmd/protonvpn-wg/main.go
+          if ($LASTEXITCODE -ne 0) { throw 'A compilação do helper Proton falhou.' }
       - name: Configurar .NET
         uses: actions/setup-dotnet@v6
         with:
@@ -36,6 +74,7 @@ jobs:
       - name: Criar release e anexar executável
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
           generate_release_notes: true
           files: |
             release/app/GVPN.exe

@@ -1,0 +1,115 @@
+name: Atualizar helper Proton automaticamente
+
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: proton-helper-auto-update
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: windows-latest
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      proton_version: ${{ steps.compare.outputs.proton_version }}
+      gvpn_version: ${{ steps.compare.outputs.gvpn_version }}
+      tag_name: ${{ steps.compare.outputs.tag_name }}
+    steps:
+      - name: Baixar a branch principal
+        uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: Comparar versão oficial Proton
+        id: compare
+        shell: pwsh
+        run: |
+          $url = 'https://raw.githubusercontent.com/ProtonVPN/proton-vpn-gtk-app/stable/versions.yml'
+          $response = Invoke-WebRequest -Uri $url -TimeoutSec 30
+          if ($response.StatusCode -ne 200) { throw 'Consulta Proton falhou; release automático cancelado.' }
+          $match = [regex]::Match($response.Content, '(?m)^version:\s*(\d+\.\d+\.\d+)\s*$')
+          if (-not $match.Success) { throw 'A Proton retornou uma versão inválida; release automático cancelado.' }
+          $latest = $match.Groups[1].Value
+          if ($latest -notmatch '^\d+\.\d+\.\d+$') { throw 'Formato de versão Proton inválido.' }
+          $known = (Get-Content 'ThirdParty/proton-confgen/PROTON_CLIENT_VERSION' -Raw).Trim()
+          if ($known -notmatch '^\d+\.\d+\.\d+$') { throw 'O arquivo de versão conhecida está inválido.' }
+          $latestSemVer = [version]$latest
+          $knownSemVer = [version]$known
+          if ($latestSemVer -lt $knownSemVer) { throw "A versão upstream ($latest) é anterior à registrada ($known); revisão necessária." }
+          if ($latest -eq $known) {
+            'changed=false' >> $env:GITHUB_OUTPUT
+            Write-Host "Helper já está na versão Proton $known."
+            exit 0
+          }
+          [xml]$project = Get-Content 'GVPN.csproj'
+          $current = [version]$project.Project.PropertyGroup.Version
+          $next = '{0}.{1}.{2}' -f $current.Major, $current.Minor, ($current.Build + 1)
+          $tag = "v$next"
+          "changed=true" >> $env:GITHUB_OUTPUT
+          "proton_version=$latest" >> $env:GITHUB_OUTPUT
+          "gvpn_version=$next" >> $env:GITHUB_OUTPUT
+          "tag_name=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Nova versão Proton $latest; será publicada como GVPN $tag."
+
+  prepare:
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
+    runs-on: windows-latest
+    outputs:
+      ref: ${{ steps.prepare.outputs.ref }}
+      tag: ${{ steps.prepare.outputs.tag }}
+    steps:
+      - name: Baixar branch principal
+        uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: Atualizar marcador e versão do GVPN
+        id: prepare
+        shell: pwsh
+        env:
+          GVPN_VERSION: ${{ needs.detect.outputs.gvpn_version }}
+          PROTON_VERSION: ${{ needs.detect.outputs.proton_version }}
+          RELEASE_TAG: ${{ needs.detect.outputs.tag_name }}
+        run: |
+          if ($env:GVPN_VERSION -notmatch '^\d+\.\d+\.\d+$' -or $env:PROTON_VERSION -notmatch '^\d+\.\d+\.\d+$') {
+            throw 'Versões inválidas; nenhuma publicação será feita.'
+          }
+          [xml]$project = Get-Content 'GVPN.csproj'
+          $project.Project.PropertyGroup.Version = $env:GVPN_VERSION
+          $project.Save((Resolve-Path 'GVPN.csproj'))
+          Set-Content -Path 'ThirdParty/proton-confgen/PROTON_CLIENT_VERSION' -Value $env:PROTON_VERSION -NoNewline
+          $apiPath = 'ThirdParty/proton-confgen/internal/constants/api.go'
+          $apiSource = Get-Content $apiPath -Raw
+          $appValue = 'AppVersion = "linux-vpn@' + $env:PROTON_VERSION + '"'
+          $userAgentValue = 'UserAgent  = "ProtonVPN/' + $env:PROTON_VERSION + ' (Linux; Ubuntu)"'
+          $apiSource = [regex]::Replace($apiSource, 'AppVersion\s*=\s*"linux-vpn@\d+\.\d+\.\d+"', $appValue)
+          $apiSource = [regex]::Replace($apiSource, 'UserAgent\s*=\s*"ProtonVPN/\d+\.\d+\.\d+ \(Linux; Ubuntu\)"', $userAgentValue)
+          if ($apiSource -notmatch [regex]::Escape("linux-vpn@$env:PROTON_VERSION") -or $apiSource -notmatch [regex]::Escape("ProtonVPN/$env:PROTON_VERSION (Linux; Ubuntu)")) {
+            throw 'Não foi possível atualizar os valores de fallback do helper.'
+          }
+          Set-Content -Path $apiPath -Value $apiSource -NoNewline
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add GVPN.csproj ThirdParty/proton-confgen/PROTON_CLIENT_VERSION ThirdParty/proton-confgen/internal/constants/api.go
+          git commit -m "chore: update Proton helper to $env:PROTON_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Não foi possível criar o commit automático.' }
+          git push origin HEAD:main
+          if ($LASTEXITCODE -ne 0) { throw 'Não foi possível atualizar a branch principal.' }
+          git tag $env:RELEASE_TAG
+          if ($LASTEXITCODE -ne 0) { throw 'Não foi possível criar a tag da release.' }
+          git push origin $env:RELEASE_TAG
+          if ($LASTEXITCODE -ne 0) { throw 'Não foi possível enviar a tag da release.' }
+          "tag=$env:RELEASE_TAG" >> $env:GITHUB_OUTPUT
+          "ref=$env:RELEASE_TAG" >> $env:GITHUB_OUTPUT
+  publish:
+    needs: [detect, prepare]
+    uses: ./.github/workflows/release.yml
+    with:
+      ref: ${{ needs.prepare.outputs.ref }}
+      tag_name: ${{ needs.prepare.outputs.tag }}
+      proton_version: ${{ needs.detect.outputs.proton_version }}

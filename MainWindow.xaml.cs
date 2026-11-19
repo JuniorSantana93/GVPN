@@ -203,6 +203,7 @@ public partial class MainWindow : Window
             switch (action)
             {
                 case "login": await LoginAsync(root); break;
+                case "create-account": OpenProtonSignup(); break;
                 case "select-server": await SelectServerAsync(ReadString(root, "name")); break;
                 case "sort": _sort = ReadString(root, "value"); await PushWebStateAsync(); break;
                 case "region": _region = ReadString(root, "value"); await PushWebStateAsync(); break;
@@ -577,6 +578,8 @@ public partial class MainWindow : Window
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr SHGetFileInfo(string path, uint attributes, ref ShellFileInfo info, uint fileInfoSize, uint flags);
     [DllImport("user32.dll")] private static extern bool DestroyIcon(IntPtr handle);
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr handle);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr handle, int command);
 
     private async Task UpdateSettingAsync(JsonElement root)
     {
@@ -819,6 +822,20 @@ public partial class MainWindow : Window
         _trayIcon.DoubleClick += (_, _) => Dispatcher.Invoke(ShowFromTray);
     }
 
+    public void BringToForeground()
+    {
+        if (!IsVisible) Show();
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        Activate();
+
+        IntPtr handle = new WindowInteropHelper(this).Handle;
+        if (handle != IntPtr.Zero)
+        {
+            _ = ShowWindow(handle, 9);
+            _ = SetForegroundWindow(handle);
+        }
+    }
+
     private void HideToTray() { if (_trayIcon == null) InitializeTrayIcon(); Hide(); }
     private void ShowFromTray() { Show(); WindowState = WindowState.Normal; Activate(); }
     private void ExitFromTray() { _allowExit = true; _trayIcon?.Dispose(); _trayIcon = null; Close(); }
@@ -827,6 +844,11 @@ public partial class MainWindow : Window
 
     private void ShowAccount() => MessageBox.Show($"Conta Proton: {_username}\n{(_isFree ? "Plano Free" : "Plano Premium")}\n{_serverSummary}", "Minha Conta", MessageBoxButton.OK, MessageBoxImage.Information);
     private void OpenSupport() { try { Process.Start(new ProcessStartInfo("https://protonvpn.com/support/") { UseShellExecute = true }); } catch (Exception ex) { MessageBox.Show(ex.Message, "GVPN", MessageBoxButton.OK, MessageBoxImage.Error); } }
+    private void OpenProtonSignup()
+    {
+        try { Process.Start(new ProcessStartInfo("https://account.protonvpn.com/signup?ref=windows") { UseShellExecute = true }); }
+        catch (Exception ex) { MessageBox.Show($"Não foi possível abrir a página de criação da conta Proton: {ex.Message}", "GVPN", MessageBoxButton.OK, MessageBoxImage.Error); }
+    }
     private static void OpenProtonCaptcha(string? url)
     {
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps ||
@@ -834,9 +856,17 @@ public partial class MainWindow : Window
         try { Process.Start(new ProcessStartInfo(uri.ToString()) { UseShellExecute = true }); } catch { }
     }
 
-    private static string FriendlyLoginError(string value) => value.Contains("temporary Proton session operation failure", StringComparison.OrdinalIgnoreCase)
-        ? "A Proton não respondeu neste momento. Isso não significa que sua senha esteja errada. Verifique a conexão e tente novamente em instantes."
-        : value;
+    private static string FriendlyLoginError(string value)
+    {
+        if (value.Contains("5003", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("APP_VERSION_BAD", StringComparison.OrdinalIgnoreCase))
+            return "A Proton recusou a versão de autenticação usada pelo GVPN (erro 5003). Atualize o GVPN para a versão mais recente e tente novamente. Se já estiver atualizado, aguarde uma atualização do componente de autenticação.";
+
+        if (value.Contains("temporary Proton session operation failure", StringComparison.OrdinalIgnoreCase))
+            return "A Proton não respondeu neste momento. Isso não significa que sua senha esteja errada. Verifique a conexão e tente novamente em instantes.";
+
+        return value;
+    }
     private static string ReadString(JsonElement root, string name) => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
     private static bool ReadBool(JsonElement root, string name) => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
 

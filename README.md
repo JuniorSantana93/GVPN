@@ -34,13 +34,18 @@ Baixe `GVPN.exe` na página [Releases](../../releases/latest). O app é distribu
 ## Compilar
 
 1. Instale o .NET SDK 8 e o Go compatível com `ThirdParty/proton-confgen/go.mod`.
-2. Compile o helper para Windows x64:
+2. Compile o helper para Windows x64 com a versão oficial atual:
 
    ```powershell
    Push-Location ThirdParty/proton-confgen
+   $versionText = Invoke-RestMethod 'https://raw.githubusercontent.com/ProtonVPN/proton-vpn-gtk-app/stable/versions.yml'
+   $match = [regex]::Match($versionText, '(?m)^version:\s*(\d+\.\d+\.\d+)\s*$')
+   if (-not $match.Success) { throw 'Não foi possível validar a versão atual da Proton.' }
+   $version = $match.Groups[1].Value
    $env:GOOS = 'windows'
    $env:GOARCH = 'amd64'
-   go build -o build/proton-confgen.exe ./cmd/protonvpn-wg/main.go
+   $ldflags = "-X 'proton-vpn-wg-confgen/internal/constants.AppVersion=linux-vpn@$version' -X 'proton-vpn-wg-confgen/internal/constants.UserAgent=ProtonVPN/$version (Linux; Ubuntu)'"
+   go build -ldflags $ldflags -o build/proton-confgen.exe ./cmd/protonvpn-wg/main.go
    Pop-Location
    ```
 
@@ -54,7 +59,9 @@ O resultado `publish/GVPN.exe` contém a interface, o helper Proton e as depend�
 
 ## Publicar uma versão
 
-Depois de enviar uma tag de versão, por exemplo `v1.1.0`, o workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) compila o helper Proton e o GVPN.exe self-contained para Windows x64 e anexa o executável a uma GitHub Release.
+Depois de enviar uma tag de versão, o workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) busca e valida a versão oficial da Proton antes de compilar. Se não conseguir obter uma versão válida, a publicação é interrompida.
+
+O workflow [`.github/workflows/check-proton-version.yml`](.github/workflows/check-proton-version.yml) consulta diariamente a versão oficial. Quando detectar uma versão nova, atualiza o componente, incrementa o patch do GVPN, publica o executável e cria uma release automaticamente. Se a fonte estiver indisponível ou retornar dados inválidos, não altera o projeto nem publica uma versão.
 
 ## Aviso de segurança e privacidade
 

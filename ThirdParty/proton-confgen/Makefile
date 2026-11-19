@@ -5,17 +5,15 @@ BUILD_DIR=build
 CMD_DIR=cmd/protonvpn-wg
 MODULE=protonvpn-wg-confgen
 
-# Fetch latest ProtonVPN Linux client version from GitHub, falling back to a
-# pinned value. The fallback must be applied on empty output, not on exit
-# status: the `cut` at the end of the pipeline succeeds even when curl fails,
-# so a `||` here would never fire and would stamp an empty version. Proton
-# rejects or human-verifies requests carrying a malformed app version.
+# Fetch the latest ProtonVPN Linux client version from GitHub. Do not silently
+# build with an old fallback: Proton rejects stale client versions (API 5003).
 PROTON_VERSION_URL=https://raw.githubusercontent.com/ProtonVPN/proton-vpn-gtk-app/stable/versions.yml
-PROTON_VERSION_FALLBACK=4.18.7
-PROTON_VERSION ?= $(shell curl -sf "$(PROTON_VERSION_URL)" 2>/dev/null | head -1 | cut -d' ' -f2)
+PROTON_VERSION ?= $(shell curl -fsSL "$(PROTON_VERSION_URL)" 2>/dev/null | sed -n '1{s/^version:[[:space:]]*//;p;}')
 ifeq ($(strip $(PROTON_VERSION)),)
-PROTON_VERSION=$(PROTON_VERSION_FALLBACK)
-$(warning Could not fetch upstream ProtonVPN version, falling back to $(PROTON_VERSION_FALLBACK))
+$(error Could not fetch a valid ProtonVPN version from upstream. Set PROTON_VERSION explicitly only if you have verified the current version.)
+endif
+ifneq ($(shell printf '%s' '$(PROTON_VERSION)' | grep -Ec '^[0-9]+\.[0-9]+\.[0-9]+$$'),1)
+$(error Invalid ProtonVPN version '$(PROTON_VERSION)'; expected X.Y.Z.)
 endif
 
 # ldflags to inject version at build time
