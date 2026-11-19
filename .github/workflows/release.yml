@@ -2,6 +2,8 @@ name: Compilar e publicar versão
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_call:
@@ -30,11 +32,47 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref || github.ref }}
+      - name: Determinar a tag da release
+        id: release_meta
+        shell: pwsh
+        env:
+          TAG_INPUT: ${{ inputs.tag_name }}
+          TARGET_REF: ${{ github.ref }}
+        run: |
+          $tag = $env:TAG_INPUT
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            if ($env:TARGET_REF -like 'refs/tags/*') {
+              $tag = $env:TARGET_REF.Substring('refs/tags/'.Length)
+            }
+            else {
+              [xml]$project = Get-Content 'GVPN.csproj'
+              $version = [string]$project.Project.PropertyGroup.Version
+              if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Versão do GVPN inválida: '$version'." }
+              $tag = "v$version"
+              $existing = git ls-remote --tags origin "refs/tags/$tag"
+              $lookupExit = $LASTEXITCODE
+              if ($lookupExit -ne 0) { throw 'Não foi possível verificar se a tag da release já existe.' }
+              if ($existing) {
+                'release=false' >> $env:GITHUB_OUTPUT
+                Write-Host "A release $tag já existe; nenhuma publicação duplicada será criada."
+                exit 0
+              }
+              git tag $tag
+              if ($LASTEXITCODE -ne 0) { throw "Não foi possível criar a tag $tag." }
+              git push origin $tag
+              if ($LASTEXITCODE -ne 0) { throw "Não foi possível publicar a tag $tag." }
+            }
+          }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Tag da release inválida: '$tag'." }
+          "tag_name=$tag" >> $env:GITHUB_OUTPUT
+          'release=true' >> $env:GITHUB_OUTPUT
       - name: Configurar Go
+        if: steps.release_meta.outputs.release == 'true'
         uses: actions/setup-go@v7
         with:
           go-version-file: ThirdParty/proton-confgen/go.mod
       - name: Obter e validar versão atual do helper Proton
+        if: steps.release_meta.outputs.release == 'true'
         id: proton
         shell: pwsh
         env:
@@ -52,6 +90,7 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           Write-Host "Compilando helper com Proton $version"
       - name: Compilar helper Proton com a versão upstream
+        if: steps.release_meta.outputs.release == 'true'
         working-directory: ThirdParty/proton-confgen
         shell: pwsh
         env:
@@ -65,16 +104,19 @@ jobs:
           go build -ldflags $ldflags -o build/proton-confgen.exe ./cmd/protonvpn-wg/main.go
           if ($LASTEXITCODE -ne 0) { throw 'A compilação do helper Proton falhou.' }
       - name: Configurar .NET
+        if: steps.release_meta.outputs.release == 'true'
         uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
       - name: Publicar executável único
+        if: steps.release_meta.outputs.release == 'true'
         shell: pwsh
         run: dotnet publish .\GVPN.csproj -c Release -r win-x64 --self-contained true -o .\release\app
       - name: Criar release e anexar executável
+        if: steps.release_meta.outputs.release == 'true'
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          tag_name: ${{ steps.release_meta.outputs.tag_name }}
           generate_release_notes: true
           files: |
             release/app/GVPN.exe

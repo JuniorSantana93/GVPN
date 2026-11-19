@@ -59,7 +59,7 @@ O resultado `publish/GVPN.exe` contém a interface, o helper Proton e as depend�
 
 ## Publicar uma versão
 
-Depois de enviar uma tag de versão, o workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) busca e valida a versão oficial da Proton antes de compilar. Se não conseguir obter uma versão válida, a publicação é interrompida.
+Ao atualizar a versão em `GVPN.csproj` e enviar o commit para `main`, o workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) cria a tag e a release automaticamente. Também aceita tags enviadas manualmente. Em ambos os casos, busca e valida a versão oficial da Proton antes de compilar; se não conseguir validá-la, a publicação é interrompida.
 
 O workflow [`.github/workflows/check-proton-version.yml`](.github/workflows/check-proton-version.yml) consulta diariamente a versão oficial. Quando detectar uma versão nova, atualiza o componente, incrementa o patch do GVPN, publica o executável e cria uma release automaticamente. Se a fonte estiver indisponível ou retornar dados inválidos, não altera o projeto nem publica uma versão.
 
