@@ -7,11 +7,13 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 
 namespace GVPN.Services
 {
@@ -21,6 +23,7 @@ namespace GVPN.Services
         private string? _wireGuardExe;
         private string? _wireSockExe;
         private Process? _wireSockProcess;
+        private SafeJobHandle? _wireSockJob;
         private bool _usingWireSock;
         private int _intentionalWireSockExit;
         private int _recoveringTunnel;
@@ -171,7 +174,7 @@ namespace GVPN.Services
             try
             {
                 StopConnectionHealthMonitor();
-                if (_usingWireSock || _wireSockProcess is not null)
+                if (_usingWireSock || _wireSockProcess is not null || _wireSockJob is not null)
                 {
                     if (_wireSockProcess is { } wsProcess)
                     {
@@ -191,6 +194,7 @@ namespace GVPN.Services
                             Interlocked.Exchange(ref _intentionalWireSockExit, 0);
                         }
                     }
+                    CloseWireSockJob();
                     _usingWireSock = false;
                     _activeProbe = null;
                     _activeConfigPath = "";
@@ -242,11 +246,30 @@ namespace GVPN.Services
             var process = new Process { StartInfo = start, EnableRaisingEvents = true };
             process.Exited += WireSockProcess_Exited;
             _wireSockProcess = process;
-            try { process.Start(); }
+            try
+            {
+                _wireSockJob = CreateKillOnCloseJob();
+                process.Start();
+            }
             catch
             {
                 _wireSockProcess = null;
                 process.Dispose();
+                CloseWireSockJob();
+                throw;
+            }
+            try
+            {
+                if (!AssignProcessToJobObject(_wireSockJob!, process.Handle))
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Não foi possível vincular o WireSock ao ciclo de vida do GVPN.");
+            }
+            catch
+            {
+                try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
+                try { await process.WaitForExitAsync(); } catch { }
+                _wireSockProcess = null;
+                process.Dispose();
+                CloseWireSockJob();
                 throw;
             }
             _ = process.StandardOutput.ReadToEndAsync();
@@ -258,6 +281,7 @@ namespace GVPN.Services
                 _wireSockProcess = null;
                 IsConnected = false;
                 process.Dispose();
+                CloseWireSockJob();
                 return (false, $"WireSock encerrou durante a conexão (código {exitCode}). Confira se o driver do WireSock está instalado e ativo.");
             }
             IsConnected = true;
@@ -267,6 +291,92 @@ namespace GVPN.Services
         }
 
         private sealed record TunnelProbeTarget(IPAddress Address, string BaselineIp);
+
+        private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+        private const int JobObjectExtendedLimitInformationClass = 9;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JobObjectBasicLimitInformation
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoCounters
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JobObjectExtendedLimitInformation
+        {
+            public JobObjectBasicLimitInformation BasicLimitInformation;
+            public IoCounters IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        private sealed class SafeJobHandle : SafeHandleZeroOrMinusOneIsInvalid
+        {
+            public SafeJobHandle(IntPtr handle) : base(ownsHandle: true) => SetHandle(handle);
+
+            protected override bool ReleaseHandle() => CloseHandle(handle);
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateJobObjectW(IntPtr jobAttributes, string? name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetInformationJobObject(SafeJobHandle job, int infoClass, ref JobObjectExtendedLimitInformation info, uint infoLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AssignProcessToJobObject(SafeJobHandle job, IntPtr process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static SafeJobHandle CreateKillOnCloseJob()
+        {
+            IntPtr rawHandle = CreateJobObjectW(IntPtr.Zero, null);
+            if (rawHandle == IntPtr.Zero)
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Não foi possível criar o controle de ciclo de vida do WireSock.");
+
+            var job = new SafeJobHandle(rawHandle);
+            var limits = new JobObjectExtendedLimitInformation
+            {
+                BasicLimitInformation = new JobObjectBasicLimitInformation { LimitFlags = JobObjectLimitKillOnJobClose }
+            };
+            if (!SetInformationJobObject(job, JobObjectExtendedLimitInformationClass, ref limits, (uint)Marshal.SizeOf<JobObjectExtendedLimitInformation>()))
+            {
+                int error = Marshal.GetLastWin32Error();
+                job.Dispose();
+                throw new System.ComponentModel.Win32Exception(error, "Não foi possível configurar o encerramento automático do WireSock.");
+            }
+            return job;
+        }
+
+        private void CloseWireSockJob()
+        {
+            Interlocked.Exchange(ref _wireSockJob, null)?.Dispose();
+        }
 
         private static async Task<TunnelProbeTarget?> CaptureProbeTargetAsync()
         {
@@ -432,6 +542,7 @@ namespace GVPN.Services
             try { exitCode = process.ExitCode; } catch { exitCode = -1; }
             bool wasConnected = IsConnected;
             _wireSockProcess = null;
+            CloseWireSockJob();
             IsConnected = false;
             StopConnectionHealthMonitor();
             TryDelete(Path.Combine(Path.GetDirectoryName(_activeConfigPath) ?? "", "GVPN_Tunnel_Split.conf"));
@@ -638,3 +749,4 @@ namespace GVPN.Services
         }
     }
 }
+
