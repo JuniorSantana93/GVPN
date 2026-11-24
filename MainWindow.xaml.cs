@@ -83,6 +83,8 @@ public partial class MainWindow : Window
     private long _settingsSaveRevision;
     private string _settingsSaveError = "";
     private bool _allowExit;
+    private bool _shutdownInProgress;
+    private bool _shutdownComplete;
     private ProtonServer? _connectedServer;
     private DateTime _connectedAt;
     private System.Windows.Forms.NotifyIcon? _trayIcon;
@@ -840,7 +842,43 @@ public partial class MainWindow : Window
     private void ShowFromTray() { Show(); WindowState = WindowState.Normal; Activate(); }
     private void ExitFromTray() { _allowExit = true; _trayIcon?.Dispose(); _trayIcon = null; Close(); }
     private void MainWindow_StateChanged(object? sender, EventArgs e) { if (WindowState == WindowState.Minimized && _settings.CloseToTray) HideToTray(); }
-    private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e) { if (_settings.CloseToTray && !_allowExit) { e.Cancel = true; HideToTray(); } else { _trayIcon?.Dispose(); _trayIcon = null; } }
+    private async void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (_settings.CloseToTray && !_allowExit)
+        {
+            e.Cancel = true;
+            HideToTray();
+            return;
+        }
+
+        if (_shutdownComplete)
+        {
+            _trayIcon?.Dispose();
+            _trayIcon = null;
+            return;
+        }
+
+        e.Cancel = true;
+        if (_shutdownInProgress) return;
+
+        _shutdownInProgress = true;
+        try
+        {
+            await _tunnel.DisconnectAsync(_proton.ProfileFile);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Falha ao encerrar o túnel WireSock durante a saída: {ex}");
+        }
+        finally
+        {
+            _shutdownComplete = true;
+            _allowExit = true;
+            _trayIcon?.Dispose();
+            _trayIcon = null;
+            Close();
+        }
+    }
 
     private void ShowAccount() => MessageBox.Show($"Conta Proton: {_username}\n{(_isFree ? "Plano Free" : "Plano Premium")}\n{_serverSummary}", "Minha Conta", MessageBoxButton.OK, MessageBoxImage.Information);
     private void OpenSupport() { try { Process.Start(new ProcessStartInfo("https://protonvpn.com/support/") { UseShellExecute = true }); } catch (Exception ex) { MessageBox.Show(ex.Message, "GVPN", MessageBoxButton.OK, MessageBoxImage.Error); } }
@@ -911,3 +949,4 @@ public partial class MainWindow : Window
         public bool CheckUpdatesOnStartup { get; set; } = true;
     }
 }
+
