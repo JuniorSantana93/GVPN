@@ -148,7 +148,13 @@ namespace GVPN.Services
                         IsConnected = true;
                         var verification = await VerifyTunnelAsync(probe);
                         if (verification.Success)
+                        {
+                            _activeConfigPath = configPath;
+                            _activeProbe = probe;
+                            _usingWireSock = false;
+                            StartConnectionHealthMonitor(configPath, probe);
                             return (true, $"Serviço e adaptador virtual {Path.GetFileNameWithoutExtension(configPath)} ativos. {verification.Message}");
+                        }
                         await DisconnectAsync(configPath);
                         return (false, $"{verification.Message} O túnel foi encerrado para restaurar a conexão normal.");
                     }
@@ -219,6 +225,9 @@ namespace GVPN.Services
             finally
             {
                 IsConnected = false;
+                _usingWireSock = false;
+                _activeProbe = null;
+                _activeConfigPath = "";
                 _disconnectGate.Release();
             }
         }
@@ -468,18 +477,30 @@ namespace GVPN.Services
                 {
                     await Task.Delay(TimeSpan.FromSeconds(12), cancellation.Token);
                     if (!IsConnected) return;
-                    var process = _wireSockProcess;
-                    if (process is null) return;
-                    try { if (process.HasExited) return; }
-                    catch (ObjectDisposedException) { return; }
-                    catch (InvalidOperationException) { return; }
+                    bool tunnelRunning;
+                    if (_usingWireSock)
+                    {
+                        var process = _wireSockProcess;
+                        if (process is null) return;
+                        try { if (process.HasExited) return; }
+                        catch (ObjectDisposedException) { return; }
+                        catch (InvalidOperationException) { return; }
+                        tunnelRunning = true;
+                    }
+                    else
+                    {
+                        string tunnelName = Path.GetFileNameWithoutExtension(configPath);
+                        string serviceName = "WireGuardTunnel$" + tunnelName;
+                        var service = await RunProcessAsync("sc.exe", $"query \"{serviceName}\"", 5000);
+                        tunnelRunning = service.ExitCode == 0 && service.Output.Contains("RUNNING", StringComparison.OrdinalIgnoreCase) && IsTunnelAdapterUp(tunnelName);
+                    }
 
                     string? currentIp = null;
                     try { currentIp = await RequestPublicIpAsync(probe.Address, cancellation.Token); }
                     catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
                     catch { }
 
-                    if (currentIp is not null && !string.Equals(currentIp, probe.BaselineIp, StringComparison.Ordinal))
+                    if (tunnelRunning && currentIp is not null && !string.Equals(currentIp, probe.BaselineIp, StringComparison.Ordinal))
                     {
                         failedProbes = 0;
                         continue;
@@ -491,11 +512,15 @@ namespace GVPN.Services
 
                     try
                     {
+                        string mode = _usingWireSock ? "WireSock" : "serviço WireGuard";
                         await DisconnectAsync(configPath);
                         bool restored = await WaitForNormalInternetAsync(probe);
+                        string cause = tunnelRunning
+                            ? "O túnel VPN perdeu acesso à internet em três verificações seguidas."
+                            : $"O {mode} parou em três verificações seguidas.";
                         ConnectionLost?.Invoke(this, restored
-                            ? "O túnel perdeu acesso à internet em três verificações seguidas. O WireSock foi encerrado e a conexão normal foi restaurada."
-                            : "O túnel perdeu acesso à internet em três verificações seguidas. O WireSock foi encerrado, mas não foi possível confirmar a restauração. Reinicie a conexão de rede do Windows.");
+                            ? $"{cause} O túnel foi encerrado e a conexão normal com a internet foi restaurada."
+                            : $"{cause} O túnel foi encerrado, mas não foi possível confirmar a restauração. Reinicie a conexão de rede do Windows.");
                     }
                     catch (Exception ex)
                     {
@@ -547,10 +572,8 @@ namespace GVPN.Services
             StopConnectionHealthMonitor();
             TryDelete(Path.Combine(Path.GetDirectoryName(_activeConfigPath) ?? "", "GVPN_Tunnel_Split.conf"));
             var probe = _activeProbe;
-            ConnectionLost?.Invoke(this, wasConnected
-                ? $"O processo WireSock encerrou inesperadamente (código {exitCode}); verificando a recuperação da internet."
-                : $"O processo WireSock encerrou durante a conexão (código {exitCode}).");
             if (wasConnected && probe is not null) _ = ReportUnexpectedWireSockExitAsync(probe, exitCode);
+            else ConnectionLost?.Invoke(this, $"O processo WireSock encerrou durante a conexão (código {exitCode}).");
         }
 
         private async Task ReportUnexpectedWireSockExitAsync(TunnelProbeTarget probe, int exitCode)
@@ -749,4 +772,3 @@ namespace GVPN.Services
         }
     }
 }
-

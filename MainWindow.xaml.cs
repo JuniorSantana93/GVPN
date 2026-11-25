@@ -85,6 +85,8 @@ public partial class MainWindow : Window
     private bool _allowExit;
     private bool _shutdownInProgress;
     private bool _shutdownComplete;
+    private bool _autoReconnectInProgress;
+    private CancellationTokenSource? _autoReconnectCancellation;
     private ProtonServer? _connectedServer;
     private DateTime _connectedAt;
     private System.Windows.Forms.NotifyIcon? _trayIcon;
@@ -100,14 +102,7 @@ public partial class MainWindow : Window
         if (_settings.CloseToTray) InitializeTrayIcon();
         _connectionTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _connectionTimer.Tick += (_, _) => _ = AppWebView?.ExecuteScriptAsync($"window.gvpn?.updateDuration({JsonSerializer.Serialize(ConnectionDuration)})");
-        _tunnel.ConnectionLost += (_, message) => Dispatcher.BeginInvoke(new Action(async () =>
-        {
-            _connectionTimer.Stop();
-            _connectedServer = null;
-            _connectionStatus = "FALHA NA CONEXÃO";
-            _serverSummary = message;
-            await PushWebStateAsync();
-        }));
+        _tunnel.ConnectionLost += (_, message) => Dispatcher.BeginInvoke(new Action(async () => await HandleConnectionLostAsync(message)));
     }
 
     private string ConnectionDuration
@@ -356,7 +351,7 @@ public partial class MainWindow : Window
         await ToggleConnectionAsync();
     }
 
-    private async Task ToggleConnectionAsync()
+    private async Task ToggleConnectionAsync(bool autoReconnect = false, int reconnectAttempt = 0)
     {
         if (_tunnel.IsConnected)
         {
@@ -368,7 +363,10 @@ public partial class MainWindow : Window
         }
         var server = _servers.FirstOrDefault(s => s.Name == _selectedServer);
         if (server is null) { _serverSummary = "Selecione um servidor da lista."; await PushWebStateAsync(); return; }
-        _busy = true; _connectionStatus = "PREPARANDO CONEXÃO…"; _connectedServer = server; _serverSummary = "Solicitando o perfil WireGuard à Proton…";
+        _busy = true;
+        _connectionStatus = autoReconnect ? $"RECONEXÃO AUTOMÁTICA ({reconnectAttempt}/5)…" : "PREPARANDO CONEXÃO…";
+        _connectedServer = server;
+        _serverSummary = autoReconnect ? $"Gerando um novo perfil para o servidor {server.Name}…" : "Solicitando o perfil WireGuard à Proton…";
         await PushWebStateAsync();
         try
         {
@@ -376,7 +374,15 @@ public partial class MainWindow : Window
             var generated = await _proton.GenerateProfileAsync(_username, server);
             if (!generated.Success) { _connectionStatus = "FALHA AO GERAR PERFIL"; _serverSummary = generated.Message; _connectedServer = null; return; }
 
-            if (!_tunnel.HasWireSock)
+            if (!_tunnel.HasWireSock && autoReconnect && _tunneledApps.Count > 0)
+            {
+                _connectionStatus = "FALHA NA CONEXÃO";
+                _serverSummary = "A reconexão automática não pode restaurar o Split Tunneling porque o WireSock não está disponível.";
+                _connectedServer = null;
+                return;
+            }
+
+            if (!_tunnel.HasWireSock && !autoReconnect)
             {
                 var installChoice = MessageBox.Show(this,
                     "O WireSock SDK é necessário para o Split Tunneling e permite que o GVPN use o WireSock para a conexão completa.\n\n" +
@@ -408,15 +414,100 @@ public partial class MainWindow : Window
                 }
             }
 
-            _connectionStatus = "INICIANDO TÚNEL VPN…"; await PushWebStateAsync();
+            _connectionStatus = autoReconnect ? $"RECONEXÃO AUTOMÁTICA ({reconnectAttempt}/5)…" : "INICIANDO TÚNEL VPN…";
+            await PushWebStateAsync();
             var connected = await _tunnel.ConnectAsync(_proton.ProfileFile, _tunneledApps);
             if (!connected.Success) { _connectionStatus = "FALHA NA CONEXÃO"; _serverSummary = connected.StatusMessage; _connectedServer = null; return; }
             _connectionStatus = "VPN CONECTADA"; _connectedAt = DateTime.Now; _connectionTimer.Start();
             _serverSummary = connected.StatusMessage;
         }
         catch (Exception ex) { _connectionStatus = "FALHA NA CONEXÃO"; _serverSummary = ex.Message; _connectedServer = null; }
-        finally { _busy = false; await PushWebStateAsync(); }
+            finally { if (!autoReconnect) _busy = false; await PushWebStateAsync(); }
     }
+
+    private async Task HandleConnectionLostAsync(string message)
+    {
+        _connectionTimer.Stop();
+        if (_busy) return;
+        bool unexpectedDrop = message.Contains("perdeu acesso", StringComparison.OrdinalIgnoreCase) ||
+                              message.Contains("encerrou inesperadamente", StringComparison.OrdinalIgnoreCase) ||
+                              message.Contains("parou em três verificações", StringComparison.OrdinalIgnoreCase) ||
+                              message.Contains("recuperação automática falhou", StringComparison.OrdinalIgnoreCase);
+        if (unexpectedDrop && _settings.AutoReconnect && !_shutdownInProgress && !_busy &&
+            !_autoReconnectInProgress && _connectedServer is { } server && !string.IsNullOrWhiteSpace(_username))
+        {
+            await AutoReconnectAsync(server, message);
+            return;
+        }
+
+        _connectedServer = null;
+        _connectionStatus = "FALHA NA CONEXÃO";
+        _serverSummary = message;
+        await PushWebStateAsync();
+    }
+
+    private async Task AutoReconnectAsync(ProtonServer server, string reason)
+    {
+        if (_autoReconnectInProgress) return;
+        _autoReconnectInProgress = true;
+        _autoReconnectCancellation = new CancellationTokenSource();
+        CancellationToken cancellationToken = _autoReconnectCancellation.Token;
+        _busy = true;
+        int[] retryDelaysSeconds = { 5, 10, 20, 30 };
+        bool reconnected = false;
+
+        try
+        {
+            for (int attempt = 1; attempt <= 5; attempt++)
+            {
+                if (!_settings.AutoReconnect || _shutdownInProgress || cancellationToken.IsCancellationRequested) break;
+                if (attempt > 1)
+                    await Task.Delay(TimeSpan.FromSeconds(retryDelaysSeconds[attempt - 2]), cancellationToken);
+                if (!_settings.AutoReconnect || _shutdownInProgress || cancellationToken.IsCancellationRequested) break;
+
+                _selectedServer = server.Name;
+                _connectedServer = server;
+                _connectionStatus = $"RECONEXÃO AUTOMÁTICA ({attempt}/5)…";
+                _serverSummary = attempt == 1 ? reason : $"Tentando reconectar ao servidor {server.Name} ({attempt}/5)…";
+                await PushWebStateAsync();
+
+                await ToggleConnectionAsync(autoReconnect: true, reconnectAttempt: attempt);
+                if (_tunnel.IsConnected)
+                {
+                    reconnected = true;
+                    break;
+                }
+            }
+
+            if (!reconnected)
+            {
+                _connectionTimer.Stop();
+                _connectedServer = null;
+                _connectionStatus = "FALHA NA CONEXÃO";
+                _serverSummary = _settings.AutoReconnect
+                    ? "Não foi possível reconectar ao mesmo servidor após cinco tentativas. Você pode tentar conectar manualmente."
+                    : "A reconexão automática foi desativada antes de restabelecer a VPN.";
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (!_tunnel.IsConnected)
+            {
+                _connectedServer = null;
+                _connectionStatus = "FALHA NA CONEXÃO";
+                _serverSummary = "A reconexão automática foi cancelada.";
+            }
+        }
+        finally
+        {
+            _busy = false;
+            _autoReconnectInProgress = false;
+            _autoReconnectCancellation?.Dispose();
+            _autoReconnectCancellation = null;
+            await PushWebStateAsync();
+        }
+    }
+
     private async Task LogoutAsync()
     {
         _busy = true; await PushWebStateAsync();
@@ -593,6 +684,7 @@ public partial class MainWindow : Window
             case "startMinimized": _settings.StartMinimized = value; break;
             case "closeToTray": _settings.CloseToTray = value; break;
             case "checkUpdatesOnStartup": _settings.CheckUpdatesOnStartup = value; break;
+            case "autoReconnect": _settings.AutoReconnect = value; if (!value) _autoReconnectCancellation?.Cancel(); break;
             default: return;
         }
 
@@ -862,6 +954,7 @@ public partial class MainWindow : Window
         if (_shutdownInProgress) return;
 
         _shutdownInProgress = true;
+        _autoReconnectCancellation?.Cancel();
         try
         {
             await _tunnel.DisconnectAsync(_proton.ProfileFile);
@@ -928,7 +1021,7 @@ public partial class MainWindow : Window
             status = _connectionStatus, duration = ConnectionDuration, activeServer = active,
             servers, selected = _selectedServer, sort = _sort, region = _region,
             apps = _tunneledApps.Select(path => new { path, name = Path.GetFileName(path), icon = GetAppIcon(path) }).ToArray(),
-            settings = new { startWithWindows = _settings.StartWithWindows, startMinimized = _settings.StartMinimized, closeToTray = _settings.CloseToTray, checkUpdatesOnStartup = _settings.CheckUpdatesOnStartup },
+            settings = new { startWithWindows = _settings.StartWithWindows, startMinimized = _settings.StartMinimized, closeToTray = _settings.CloseToTray, checkUpdatesOnStartup = _settings.CheckUpdatesOnStartup, autoReconnect = _settings.AutoReconnect },
             settingsSaveRevision = _settingsSaveRevision, settingsSaveError = _settingsSaveError,
             currentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "—",
             checkUpdatesOnStartup = _settings.CheckUpdatesOnStartup, updateAvailable = _updateAvailable,
@@ -947,6 +1040,6 @@ public partial class MainWindow : Window
         public bool StartMinimized { get; set; }
         public bool CloseToTray { get; set; }
         public bool CheckUpdatesOnStartup { get; set; } = true;
+        public bool AutoReconnect { get; set; }
     }
 }
-
